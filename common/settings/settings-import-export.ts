@@ -45,6 +45,9 @@ const dictionaryTrackSchema = {
         dictionaryYomitanScanLength: {
             type: 'number',
         },
+        dictionaryYomitanParser: {
+            type: 'string',
+        },
         dictionaryAnkiWordFields: {
             type: 'array',
             items: {

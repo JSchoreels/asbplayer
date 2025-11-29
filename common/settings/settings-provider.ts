@@ -41,6 +41,7 @@ const defaultDictionaryTrackSettings: DictionaryTrack = {
     dictionaryTokenMatchStrategyPriority: TokenMatchStrategyPriority.EXACT,
     dictionaryYomitanUrl: 'http://127.0.0.1:19633',
     dictionaryYomitanScanLength: 16,
+    dictionaryYomitanParser: 'mecab',
     dictionaryAnkiWordFields: [],
     dictionaryAnkiSentenceFields: [],
     dictionaryAnkiSentenceTokenMatchStrategy: TokenMatchStrategy.EXACT_FORM_COLLECTED,
@@ -422,6 +423,8 @@ export const ensureConsistencyOnRead = (settings: Partial<AsbplayerSettings>) =>
     let newKeyBindSet: any = {};
     let ankiFieldSettingsModified = false;
     let newAnkiFieldSettings: any = {};
+    let dictionaryTracksModified = false;
+    let newDictionaryTracks: DictionaryTrack[] = [];
 
     if (settings.keyBindSet !== undefined) {
         const keyBindSet = settings.keyBindSet;
@@ -453,11 +456,38 @@ export const ensureConsistencyOnRead = (settings: Partial<AsbplayerSettings>) =>
         }
     }
 
-    if (!ankiFieldSettingsModified && !keyBindSetModified) {
+    if (settings.dictionaryTracks !== undefined) {
+        const dictionaryTracks = settings.dictionaryTracks;
+        const defaultTrack = defaultSettings.dictionaryTracks[0];
+
+        for (const track of dictionaryTracks) {
+            let trackModified = false;
+            const newTrack: any = { ...track };
+
+            for (const key of Object.keys(defaultTrack)) {
+                const trackKey = key as keyof DictionaryTrack;
+
+                if (newTrack[trackKey] === undefined) {
+                    newTrack[trackKey] = defaultTrack[trackKey];
+                    trackModified = true;
+                    dictionaryTracksModified = true;
+                }
+            }
+
+            newDictionaryTracks.push(newTrack);
+        }
+    }
+
+    if (!ankiFieldSettingsModified && !keyBindSetModified && !dictionaryTracksModified) {
         return settings;
     }
 
-    return { ...settings, ...{ ankiFieldSettings: newAnkiFieldSettings }, ...{ keyBindSet: newKeyBindSet } };
+    return {
+        ...settings,
+        ...(ankiFieldSettingsModified ? { ankiFieldSettings: newAnkiFieldSettings } : {}),
+        ...(keyBindSetModified ? { keyBindSet: newKeyBindSet } : {}),
+        ...(dictionaryTracksModified ? { dictionaryTracks: newDictionaryTracks } : {}),
+    };
 };
 
 type SettingsKey = keyof AsbplayerSettings;

@@ -17,12 +17,12 @@ export class Yomitan {
         this.lemmatizeCache.clear();
     }
 
-    async tokenize(track: number, text: string, scanLength: number, yomitanUrl: string) {
+    async tokenize(track: number, text: string, scanLength: number, yomitanUrl: string, parser: string) {
         let tokens = this.tokenizeCache.get(track)?.get(text);
         if (tokens) return tokens;
         tokens = [];
 
-        for (const res of await this._executeAction('tokenize', { text, scanLength }, yomitanUrl)) {
+        for (const res of await this._executeAction('tokenize', { text, scanLength, parser }, yomitanUrl)) {
             for (const tokenParts of res['content']) {
                 tokens.push(tokenParts.map((p: any) => p['text']).join('')); // [[the], [c, a, r]] -> [the, car]
             }

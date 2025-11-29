@@ -389,7 +389,8 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
                 ts.track,
                 text,
                 ts.dt.dictionaryYomitanScanLength,
-                ts.dt.dictionaryYomitanUrl
+                ts.dt.dictionaryYomitanUrl,
+                ts.dt.dictionaryYomitanParser
             );
             if (this.shouldCancelBuild) return;
             for (const rawToken of rawTokens) {
@@ -653,7 +654,8 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
                                 ts.track,
                                 field.value,
                                 ts.dt.dictionaryYomitanScanLength,
-                                ts.dt.dictionaryYomitanUrl
+                                ts.dt.dictionaryYomitanUrl,
+                                ts.dt.dictionaryYomitanParser
                             )
                         ).map((t) => t.trim());
                         if (this.shouldCancelBuild) return false;

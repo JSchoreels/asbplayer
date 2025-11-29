@@ -95,6 +95,7 @@ export interface DictionaryTrack {
     readonly dictionaryTokenMatchStrategyPriority: TokenMatchStrategyPriority;
     readonly dictionaryYomitanUrl: string;
     readonly dictionaryYomitanScanLength: number;
+    readonly dictionaryYomitanParser: string;
     readonly dictionaryAnkiWordFields: string[];
     readonly dictionaryAnkiSentenceFields: string[];
     readonly dictionaryAnkiSentenceTokenMatchStrategy: TokenMatchStrategy;
