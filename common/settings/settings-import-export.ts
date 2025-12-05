@@ -33,6 +33,9 @@ const dictionaryTrackSchema = {
         dictionaryColorizeSubtitles: {
             type: 'boolean',
         },
+        dictionaryColorizeOnHoverOnly: {
+            type: 'boolean',
+        },
         dictionaryTokenMatchStrategy: {
             type: 'string',
         },
@@ -46,6 +49,9 @@ const dictionaryTrackSchema = {
             type: 'number',
         },
         dictionaryYomitanParser: {
+            type: 'string',
+        },
+        dictionaryTokenReadingAnnotation: {
             type: 'string',
         },
         dictionaryAnkiWordFields: {
