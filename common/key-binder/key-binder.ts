@@ -6,6 +6,21 @@ export function adjacentSubtitle(forward: boolean, time: number, subtitles: Subt
     const now = time;
     let adjacentSubtitleIndex = -1;
     let minDiff = Number.MAX_SAFE_INTEGER;
+    let currentSubtitleTrack: number | undefined;
+
+    console.log('[adjacentSubtitle] forward:', forward, 'time:', now);
+
+    // First, determine the track of the current subtitle (if we're inside one)
+    for (let i = 0; i < subtitles.length; ++i) {
+        const s = subtitles[i];
+        if (now >= s.start && now < s.end) {
+            console.log('[adjacentSubtitle] Found current subtitle at index', i, 'track:', s.track, 'start:', s.start, 'end:', s.end, 'text:', s.text.substring(0, 30));
+            currentSubtitleTrack = s.track;
+            break;
+        }
+    }
+
+    console.log('[adjacentSubtitle] currentSubtitleTrack:', currentSubtitleTrack);
 
     for (let i = 0; i < subtitles.length; ++i) {
         const s = subtitles[i];
@@ -19,15 +34,40 @@ export function adjacentSubtitle(forward: boolean, time: number, subtitles: Subt
             minDiff = diff;
             adjacentSubtitleIndex = i;
         } else if (!forward && now > s.start) {
+            console.log('[adjacentSubtitle] Backward: checking index', i, 'track:', s.track, 'diff:', diff, 'now < s.end:', now < s.end);
             minDiff = diff;
-            adjacentSubtitleIndex = now < s.end ? Math.max(0, i - 1) : i;
+            // If we're currently inside a subtitle, find previous subtitle of the same track
+            if (now < s.end && currentSubtitleTrack !== undefined) {
+                console.log('[adjacentSubtitle] Looking for previous subtitle of track', currentSubtitleTrack);
+                // Find the previous subtitle with the same track
+                for (let j = i - 1; j >= 0; --j) {
+                    console.log('[adjacentSubtitle]   Checking j=', j, 'track:', subtitles[j].track);
+                    if (subtitles[j].track === currentSubtitleTrack) {
+                        adjacentSubtitleIndex = j;
+                        console.log('[adjacentSubtitle]   Found previous at j=', j);
+                        break;
+                    }
+                }
+                // If no previous subtitle found for this track, stay at current position
+                if (adjacentSubtitleIndex === -1) {
+                    adjacentSubtitleIndex = i;
+                    console.log('[adjacentSubtitle] No previous found, staying at', i);
+                }
+                // Break out of outer loop - we found the result
+                break;
+            } else {
+                adjacentSubtitleIndex = i;
+            }
         }
     }
 
     if (adjacentSubtitleIndex !== -1) {
+        const result = subtitles[adjacentSubtitleIndex];
+        console.log('[adjacentSubtitle] Returning subtitle at index', adjacentSubtitleIndex, 'track:', result.track, 'start:', result.start, 'text:', result.text.substring(0, 30));
         return subtitles[adjacentSubtitleIndex];
     }
 
+    console.log('[adjacentSubtitle] No subtitle found, returning null');
     return null;
 }
 
