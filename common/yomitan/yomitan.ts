@@ -27,8 +27,10 @@ export class Yomitan {
         if (tokens) return tokens;
         tokens = [];
 
-        for (const res of await this._executeAction('tokenize', { text, scanLength, parser }, yomitanUrl)) {
-            for (const tokenParts of res['content']) {
+        const response = await this._executeAction('tokenize', { text, scanLength, parser }, yomitanUrl);
+        // Only use the first dictionary's results to avoid duplicates when multiple dictionaries return results
+        if (response.length > 0) {
+            for (const tokenParts of response[0]['content']) {
                 tokens.push(tokenParts);
             }
         }
