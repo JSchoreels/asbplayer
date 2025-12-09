@@ -2,52 +2,94 @@ import { SubtitleModel } from '../src/model';
 import hotkeys from 'hotkeys-js';
 import { KeyBindSet } from '../settings/settings';
 
-export function adjacentSubtitle(forward: boolean, time: number, subtitles: SubtitleModel[]) {
-    const now = time;
-    let adjacentSubtitleIndex = -1;
-    let minDiff = Number.MAX_SAFE_INTEGER;
-    let currentSubtitleTrack: number | undefined;
+export function findCurrentSubtitle(time: number, subtitles: SubtitleModel[]): number | null {
+    let left = 0;
+    let right = subtitles.length - 1;
 
-    // First, determine the track of the current subtitle (if we're inside one)
-    for (let i = 0; i < subtitles.length; ++i) {
-        const s = subtitles[i];
-        if (now >= s.start && now < s.end) {
-            currentSubtitleTrack = s.track;
-            break;
+    while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        const s = subtitles[mid];
+
+        if (time >= s.start && time < s.end) {
+            return mid;
+        }
+
+        if (time < s.start) {
+            right = mid - 1;
+        } else {
+            left = mid + 1;
         }
     }
 
-    for (let i = 0; i < subtitles.length; ++i) {
-        const s = subtitles[i];
-        const diff = forward ? s.start - now : now - s.start;
+    return null;
+}
 
-        if (minDiff <= diff) {
+export function findAllCurrentSubtitles(time: number, subtitles: SubtitleModel[]): number[] {
+    const firstIndex = findCurrentSubtitle(time, subtitles);
+    if (firstIndex === null) {
+        return [];
+    }
+
+    const matches: number[] = [];
+
+    // Search backward from the found index to find all overlapping subtitles
+    for (let i = firstIndex; i >= 0; --i) {
+        if (time >= subtitles[i].start && time < subtitles[i].end) {
+            matches.unshift(i);
             continue;
         }
+        break;
+    }
 
-        if (forward && now < s.start) {
+    // Search forward from the found index to find all overlapping subtitles
+    for (let i = firstIndex + 1; i < subtitles.length; ++i) {
+        if (time >= subtitles[i].start && time < subtitles[i].end) {
+            matches.push(i);
+            continue;
+        }
+        break;
+    }
+
+    return matches;
+}
+
+function seekPreviousSubtitle(time: number, currentIndex: number | null, subtitles: SubtitleModel[]): SubtitleModel | null {
+    if (currentIndex !== null) {
+        // We found a current subtitle
+        const currentStartTime = subtitles[currentIndex].start;
+        const threshold = 100; // Consider subtitles within 100ms as "same time"
+
+        // Search backward, skipping all subtitles that start at roughly the same time
+        for (let i = currentIndex - 1; i >= 0; --i) {
+            const timeDiff = Math.abs(subtitles[i].start - currentStartTime);
+            if (timeDiff > threshold) {
+                // Found a subtitle that starts at a different time - this is our target
+                return subtitles[i];
+            }
+        }
+        return null;
+    }
+
+    // No current subtitle - find the last one before 'time'
+    for (let i = subtitles.length - 1; i >= 0; --i) {
+        if (subtitles[i].start < time) {
+            return subtitles[i];
+        }
+    }
+    return null;
+}
+
+function seekNextSubtitle(time: number, currentIndex: number | null, subtitles: SubtitleModel[]): SubtitleModel | null {
+    let adjacentSubtitleIndex = -1;
+    let minDiff = Number.MAX_SAFE_INTEGER;
+
+    for (let i = 0; i < subtitles.length; ++i) {
+        const s = subtitles[i];
+        const diff = s.start - time;
+
+        if (diff > 0 && diff < minDiff) {
             minDiff = diff;
             adjacentSubtitleIndex = i;
-        } else if (!forward && now > s.start) {
-            minDiff = diff;
-            // If we're currently inside a subtitle, find previous subtitle of the same track
-            if (now < s.end && currentSubtitleTrack !== undefined) {
-                // Find the previous subtitle with the same track
-                for (let j = i - 1; j >= 0; --j) {
-                    if (subtitles[j].track === currentSubtitleTrack) {
-                        adjacentSubtitleIndex = j;
-                        break;
-                    }
-                }
-                // If no previous subtitle found for this track, stay at current position
-                if (adjacentSubtitleIndex === -1) {
-                    adjacentSubtitleIndex = i;
-                }
-                // Break out of outer loop - we found the result
-                break;
-            } else {
-                adjacentSubtitleIndex = i;
-            }
         }
     }
 
@@ -56,6 +98,11 @@ export function adjacentSubtitle(forward: boolean, time: number, subtitles: Subt
     }
 
     return null;
+}
+
+export function adjacentSubtitle(forward: boolean, time: number, subtitles: SubtitleModel[]) {
+    const currentIndex = findCurrentSubtitle(time, subtitles);
+    return forward ? seekNextSubtitle(time, currentIndex, subtitles) : seekPreviousSubtitle(time, currentIndex, subtitles);
 }
 
 export interface KeyBinder {
