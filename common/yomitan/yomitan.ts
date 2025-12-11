@@ -28,9 +28,10 @@ export class Yomitan {
         tokens = [];
 
         const response = await this._executeAction('tokenize', { text, scanLength, parser }, yomitanUrl);
-        // Only use the first dictionary's results to avoid duplicates when multiple dictionaries return results
-        if (response.length > 0) {
-            for (const tokenParts of response[0]['content']) {
+        // Prefer dictionaries with "unidic" in their name, fallback to first dictionary if not found
+        const selectedDict = response.find((dict: any) => dict.id?.includes('unidic')) || response[0];
+        if (selectedDict) {
+            for (const tokenParts of selectedDict['content']) {
                 tokens.push(tokenParts);
             }
         }
