@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useMemo } from 'react';
 import makeStyles from '@mui/styles/makeStyles';
 import { useTranslation } from 'react-i18next';
 import Box from '@mui/material/Box';
@@ -15,6 +15,9 @@ import Typography from '@mui/material/Typography';
 import IconButton from '@mui/material/IconButton';
 import CloseIcon from '@mui/icons-material/Close';
 import { type Theme } from '@mui/material';
+import { DictionaryProvider } from '../../dictionary-db';
+import { useAnnotationTutorial } from '@project/common/hooks/use-annotation-tutorial';
+import { AppExtensionGlobalStateProvider } from '../services/app-extension-global-state-provider';
 
 const appTestCard = () => {
     const basePath = window.location.pathname === '/' ? '' : window.location.pathname;
@@ -44,6 +47,7 @@ interface Props {
     anki: Anki;
     extension: ChromeExtension;
     open: boolean;
+    dictionaryProvider: DictionaryProvider;
     settings: AsbplayerSettings;
     scrollToId?: string;
     onSettingsChanged: (settings: Partial<AsbplayerSettings>) => void;
@@ -59,6 +63,7 @@ export default function SettingsDialog({
     anki,
     extension,
     open,
+    dictionaryProvider,
     settings,
     scrollToId,
     onSettingsChanged,
@@ -79,6 +84,8 @@ export default function SettingsDialog({
         updateLocalFontsPermission();
         updateLocalFonts();
     }, [updateLocalFontsPermission, updateLocalFonts]);
+    const globalStateProvider = useMemo(() => new AppExtensionGlobalStateProvider(extension), [extension]);
+    const { inAnnotationTutorial, handleAnnotationTutorialSeen } = useAnnotationTutorial({ globalStateProvider });
 
     return (
         <Dialog open={open} maxWidth="md" fullWidth className={classes.root} onClose={onClose}>
@@ -104,13 +111,20 @@ export default function SettingsDialog({
                     extensionSupportsPauseOnHover={extension.supportsPauseOnHover}
                     extensionSupportsExportCardBind={extension.supportsExportCardBind}
                     extensionSupportsPageSettings={extension.supportsPageSettings}
+                    extensionSupportsDictionary={extension.supportsDictionary}
+                    extensionSupportsDictionaryTokenStatusDisplayAlpha={
+                        extension.supportsDictionaryTokenStatusDisplayAlpha
+                    }
                     pageConfigs={extension.pageConfig}
                     insideApp
                     appVersion={import.meta.env.VITE_APP_GIT_COMMIT}
                     chromeKeyBinds={extension.extensionCommands}
                     onOpenChromeExtensionShortcuts={extension.openShortcuts}
                     onSettingsChanged={onSettingsChanged}
+                    dictionaryProvider={dictionaryProvider}
                     settings={settings}
+                    profiles={profilesContext.profiles}
+                    activeProfile={profilesContext.activeProfile}
                     scrollToId={scrollToId}
                     localFontsAvailable={localFontsAvailable}
                     localFontsPermission={localFontsPermission}
@@ -118,6 +132,8 @@ export default function SettingsDialog({
                     supportedLanguages={supportedLanguages}
                     testCard={appTestCard}
                     onUnlockLocalFonts={handleUnlockLocalFonts}
+                    inAnnotationTutorial={inAnnotationTutorial}
+                    onAnnotationTutorialSeen={handleAnnotationTutorialSeen}
                 />
             </DialogContent>
             {(!extension.installed || extension.supportsSettingsProfiles) && (

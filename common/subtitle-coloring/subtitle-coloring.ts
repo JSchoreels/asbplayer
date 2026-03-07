@@ -1,196 +1,372 @@
-import { Fetcher, RichSubtitleModel } from '@project/common';
+import {
+    DictionaryBuildAnkiCacheStateError,
+    DictionaryBuildAnkiCacheStateType,
+    Fetcher,
+    RichSubtitleModel,
+    Token,
+    Tokenization,
+    TokenizedSubtitleModel,
+    TokenReading,
+} from '@project/common';
 import { Anki } from '@project/common/anki';
 import {
+    ApplyStrategy,
+    areDictionaryTracksEqual,
     AsbplayerSettings,
+    dictionaryStatusCollectionEnabled,
+    DictionaryTokenSource,
     DictionaryTrack,
     dictionaryTrackEnabled,
-    dictionaryTrackHoverOnly,
     getFullyKnownTokenStatus,
+    SettingsProvider,
+    TokenFrequencyAnnotation,
     TokenMatchStrategy,
     TokenMatchStrategyPriority,
     TokenReadingAnnotation,
+    TokenState,
     TokenStatus,
     TokenStyling,
 } from '@project/common/settings';
+import { CardStatus, DictionaryProvider, LemmaResults, TokenResults } from '@project/common/dictionary-db';
 import { SubtitleCollection, SubtitleCollectionOptions } from '@project/common/subtitle-collection';
-import { arrayEquals, filterAsync, inBatches } from '@project/common/util';
-import { TokenPart, Yomitan } from '@project/common/yomitan/yomitan';
+import {
+    arrayEquals,
+    HAS_LETTER_REGEX,
+    inBatches,
+    iterateOverStringInBlocks,
+    ONLY_ASCII_LETTERS_REGEX,
+    areTokenizationsEqual,
+} from '@project/common/util';
+import { Yomitan } from '@project/common/yomitan/yomitan';
 
-const TOKEN_CACHE_BUILD_AHEAD = 50;
+const TOKEN_CACHE_BUILD_AHEAD_INIT = 10;
+const TOKEN_CACHE_BUILD_AHEAD = 100;
+const TOKEN_CACHE_BUILD_AHEAD_THRESHOLD = 10; // Only build ahead with only this many rich subtitles left
 const TOKEN_CACHE_BATCH_SIZE = 1; // Processing more than 1 at a time is slower
 const TOKEN_CACHE_ERROR_REFRESH_INTERVAL = 10000;
 const ANKI_RECENTLY_MODIFIED_INTERVAL = 10000;
-const MAX_CARD_INFOS = 10;
-const HAS_LETTER_REGEX = /\p{L}/u;
+
+const ASB_TOKEN_CLASS = 'asb-token';
+const ASB_TOKEN_HIGHLIGHT_CLASS = 'asb-token-highlight';
+const ASB_READING_CLASS = 'asb-reading';
+const ASB_FREQUENCY_CLASS = 'asb-frequency';
+const ASB_FREQUENCY_HOVER_CLASS = 'asb-frequency-hover';
+
+interface TokenStatusResult {
+    status: TokenStatus;
+    source: DictionaryTokenSource;
+    token?: string; // For any form filtering
+}
 
 interface TrackState {
     track: number;
     dt: DictionaryTrack;
     yt: Yomitan | undefined;
-    tokenStatusCache: Map<string, TokenStatus | null>;
-    ankiCardIdStatuses: Map<number, TokenStatus>;
-    ankiSuspendedCardIds: Set<number>;
+    collectedExactForm: Map<string, TokenStatusResult>;
+    collectedLemmaForm: Map<string, TokenStatusResult>;
+    collectedAnyForm: Map<string, TokenStatusResult[]>;
+    tokenStates: Map<string, TokenState[]>;
+}
+
+function shouldUseExactForm(s: TokenMatchStrategy): boolean {
+    return s === TokenMatchStrategy.EXACT_FORM_COLLECTED || s === TokenMatchStrategy.LEMMA_OR_EXACT_FORM_COLLECTED;
+}
+
+function shouldUseLemmaForm(s: TokenMatchStrategy): boolean {
+    return s === TokenMatchStrategy.LEMMA_FORM_COLLECTED || s === TokenMatchStrategy.LEMMA_OR_EXACT_FORM_COLLECTED;
+}
+
+function shouldUseAnyForm(s: TokenMatchStrategy): boolean {
+    return s === TokenMatchStrategy.ANY_FORM_COLLECTED;
+}
+
+export interface InternalToken extends Token {
+    __internal?: boolean;
+}
+
+interface InternalSubtitleModel extends TokenizedSubtitleModel {
+    text: string;
+    __tokenized?: boolean;
+}
+
+function untokenize(s: InternalSubtitleModel) {
+    s.__tokenized = undefined;
+    s.richText = undefined;
+    if (s.tokenization) {
+        s.tokenization.tokens = s.tokenization.tokens.filter((t) => !(t as InternalToken).__internal);
+        if (s.tokenization.tokens.length) {
+            s.tokenization.error = undefined;
+            for (const token of s.tokenization.tokens) {
+                token.states = [];
+                token.status = undefined;
+            }
+        } else {
+            s.tokenization = undefined;
+        }
+    }
+    if (s.originalText !== undefined) s.text = s.originalText;
+}
+
+function originalTokenization(tokenization: Tokenization | undefined): Tokenization {
+    return {
+        tokens:
+            tokenization?.tokens
+                ?.filter((t) => !(t as InternalToken).__internal)
+                .map((t) => ({
+                    pos: [t.pos[0], t.pos[1]],
+                    readings: t.readings.map((r) => ({ pos: [r.pos[0], r.pos[1]], reading: r.reading })),
+                    states: [],
+                })) ?? [],
+    };
+}
+
+function resetYomitan(ts: TrackState) {
+    if (!ts.yt) return;
+    ts.yt.resetCache();
+    ts.yt = undefined;
 }
 
 export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
-    private _subtitles: RichSubtitleModel[];
-    private settings?: AsbplayerSettings;
-    private initialSettings: Promise<AsbplayerSettings>;
-    private subtitlesInterval?: NodeJS.Timeout;
+    private _subtitles: InternalSubtitleModel[];
+    private readonly dictionaryProvider: DictionaryProvider;
+    private readonly settingsProvider: SettingsProvider;
+    private subtitlesInterval?: ReturnType<typeof setInterval>;
     private showingSubtitles?: RichSubtitleModel[];
     private showingNeedsRefreshCount: number;
+    private buildLowerThreshold: number;
+    private buildUpperThreshold: number;
+    private initialized: boolean; // The first build after startup/reset has been completed
 
+    private profile: string | undefined | null;
     private anki: Anki | undefined;
     private readonly fetcher?: Fetcher;
     private trackStates: TrackState[];
-    private erroredCache: Set<number>;
-    private uncollectedCache: Set<number>;
-    private uncollectedNeedsRefresh: boolean;
+    private refreshCache: Set<number>; // Re-processes these indexes on next build
+    private erroredCache: Set<number>; // Re-processes these indexes if they are in the build threshold
+    private tokenToIndexesCache: Map<string, Set<number>>;
+    private tokensForRefresh: Set<string>;
+    private externalTokenReadings: Map<string, Map<number, TokenReading[]>>;
     private ankiRecentlyModifiedCardIds: Set<number>;
     private ankiLastRecentlyModifiedCheck: number;
+    private ankiRecentlyModifiedTrigger: boolean;
     private ankiRecentlyModifiedFirstCheck: boolean;
     private colorCacheLastRefresh: number;
     private colorCacheBuilding: boolean;
     private colorCacheBuildingCurrentIndexes: Set<number>;
     private shouldCancelBuild: boolean; // Set to true to stop current color cache build, checked after each async call
-    private tokenRequestFailed: boolean;
+    private tokenRequestFailedForTracks: Set<number>;
 
-    private readonly subtitleColorsUpdated: (updatedSubtitles: RichSubtitleModel[]) => void;
+    private readonly subtitleColorsUpdated: (updatedSubtitles: RichSubtitleModel[], dt: DictionaryTrack[]) => void;
     private readonly getMediaTimeMs?: () => number;
 
+    private removeBuildAnkiCacheStateChangeCB?: () => void;
+    private removeAnkiCardModifiedCB?: () => void;
+
     constructor(
-        initialSettings: Promise<AsbplayerSettings>,
+        dictionaryProvider: DictionaryProvider,
+        settingsProvider: SettingsProvider,
         options: SubtitleCollectionOptions,
-        subtitleColorsUpdated: (updatedSubtitles: RichSubtitleModel[]) => void,
+        subtitleColorsUpdated: (updatedSubtitles: RichSubtitleModel[], dt: DictionaryTrack[]) => void,
         getMediaTimeMs?: () => number,
         fetcher?: Fetcher
     ) {
         super({ ...options, returnNextToShow: true });
         this._subtitles = [];
-        this.initialSettings = initialSettings;
+        this.buildLowerThreshold = 0;
+        this.buildUpperThreshold = 0;
+        this.initialized = false;
+        this.dictionaryProvider = dictionaryProvider;
+        this.settingsProvider = settingsProvider;
+        this.profile = null;
         this.fetcher = fetcher;
         this.trackStates = [];
         this.subtitleColorsUpdated = subtitleColorsUpdated;
         this.getMediaTimeMs = getMediaTimeMs;
         this.showingNeedsRefreshCount = 0;
+        this.refreshCache = new Set();
         this.erroredCache = new Set();
-        this.uncollectedCache = new Set();
-        this.uncollectedNeedsRefresh = false;
+        this.tokenToIndexesCache = new Map();
+        this.tokensForRefresh = new Set();
+        this.externalTokenReadings = new Map();
         this.ankiRecentlyModifiedCardIds = new Set();
         this.ankiLastRecentlyModifiedCheck = Date.now();
+        this.ankiRecentlyModifiedTrigger = false;
         this.ankiRecentlyModifiedFirstCheck = true;
         this.colorCacheLastRefresh = Date.now();
         this.colorCacheBuilding = false;
         this.colorCacheBuildingCurrentIndexes = new Set();
         this.shouldCancelBuild = false;
-        this.tokenRequestFailed = false;
+        this.tokenRequestFailedForTracks = new Set();
     }
 
     get subtitles() {
         return this._subtitles;
     }
 
-    setSubtitles(subtitles: RichSubtitleModel[]) {
+    setSubtitles(subtitles: TokenizedSubtitleModel[]) {
+        for (const s of subtitles) {
+            if (s.originalText === undefined) s.originalText = s.text;
+        }
         const needsReset =
             subtitles.length !== this._subtitles.length ||
-            subtitles.some((s) => s.text !== this._subtitles[s.index].text);
-        if (!needsReset) subtitles.forEach((s) => (s.richText = this._subtitles[s.index].richText)); // Preserve existing cache here so callers don't need to be aware of it
+            subtitles.some((s) => {
+                const prev = this._subtitles[s.index];
+                if ((s.originalText ?? s.text) !== (prev.originalText ?? prev.text)) return true;
+                return !areTokenizationsEqual(
+                    originalTokenization(s.tokenization),
+                    originalTokenization(prev.tokenization)
+                );
+            });
+        if (!needsReset) {
+            // Preserve existing cache here so callers don't need to be aware of it
+            for (const s of subtitles) {
+                (s as InternalSubtitleModel).text = this._subtitles[s.index].text;
+                s.tokenization = this._subtitles[s.index].tokenization;
+                s.richText = this._subtitles[s.index].richText;
+                (s as InternalSubtitleModel).__tokenized = this._subtitles[s.index].__tokenized;
+            }
+        }
         this._subtitles = subtitles.map((s) => ({ ...s })); // Separate internals from react state changes
         super.setSubtitles(this._subtitles);
         if (needsReset) {
-            this.resetCache();
-            void this._initColorCache();
+            this._resetCache();
+            this.refreshCache.clear();
+            this.erroredCache.clear();
+            this.tokenToIndexesCache.clear();
+            this.tokensForRefresh.clear();
+            this.externalTokenReadings.clear();
+            for (const subtitle of this._subtitles) {
+                if (!subtitle.tokenization) continue;
+                for (const token of subtitle.tokenization.tokens) {
+                    if ((token as InternalToken).__internal) continue;
+                    if (!token.readings.length) continue;
+                    const tokenText = subtitle.text.substring(token.pos[0], token.pos[1]);
+                    let externalReadings = this.externalTokenReadings.get(tokenText);
+                    if (!externalReadings) {
+                        externalReadings = new Map();
+                        this.externalTokenReadings.set(tokenText, externalReadings);
+                    }
+                    externalReadings.set(subtitle.track, token.readings);
+                }
+            }
+            const { colorBufferStartIndex, colorBufferEndIndex } = this._getColorBufferIndexes(true);
+            void this._buildColorCache(colorBufferStartIndex, colorBufferEndIndex, true);
         }
     }
 
-    resetCache(settings?: AsbplayerSettings) {
+    private _resetCache() {
         if (this.colorCacheBuilding) this.shouldCancelBuild = true;
-        if (settings) this.settings = settings;
+        this.profile = null;
         this.anki = undefined;
+        this.trackStates.forEach(resetYomitan);
         this.trackStates = [];
-        this.erroredCache.clear();
-        this.uncollectedCache.clear();
         this.ankiRecentlyModifiedCardIds.clear();
+        this.ankiRecentlyModifiedTrigger = false;
         this.ankiRecentlyModifiedFirstCheck = true;
-        this._subtitles.forEach((s) => (s.richText = undefined));
+        this._subtitles.forEach(untokenize);
+        this.buildLowerThreshold = 0;
+        this.buildUpperThreshold = 0;
+        this.initialized = false;
     }
 
     reset() {
         this.setSubtitles([]);
     }
 
-    ankiCardWasUpdated() {
-        this.uncollectedNeedsRefresh = true;
+    settingsUpdated(settings: AsbplayerSettings) {
+        let settingsAreEqual =
+            (!this.anki || this.anki.ankiConnectUrl === settings.ankiConnectUrl) &&
+            this.trackStates.length === settings.dictionaryTracks.length;
+        for (const [index, dt] of settings.dictionaryTracks.entries()) {
+            const ts = this.trackStates[index];
+            if (ts && areDictionaryTracksEqual(ts.dt, dt)) continue;
+            settingsAreEqual = false;
+            break;
+        }
+        if (settingsAreEqual) return;
+
+        const subtitlesToReset: InternalSubtitleModel[] = []; // Tracks that went from enabled to disabled need all subscribers to purge their richText
+        for (const ts of this.trackStates) {
+            if (!dictionaryTrackEnabled(ts.dt)) continue; // Already disabled
+            const newDt = settings.dictionaryTracks[ts.track];
+            if (newDt && dictionaryTrackEnabled(newDt)) continue; // We will be processing, keep current richText on screen until then
+            subtitlesToReset.push(...this._subtitles.filter((s) => s.track === ts.track));
+            ts.dt = newDt;
+        }
+        if (subtitlesToReset.length) {
+            for (const s of subtitlesToReset) {
+                untokenize(s);
+            }
+            this.subtitleColorsUpdated(subtitlesToReset, settings.dictionaryTracks);
+        }
+        this._resetCache();
+    }
+
+    tokensWereModified(modifiedTokens: string[]) {
+        for (const token of modifiedTokens) this.tokensForRefresh.add(token);
+    }
+
+    ankiCardWasModified() {
+        this.ankiRecentlyModifiedTrigger = true;
     }
 
     hoverOnly(track: number) {
-        return dictionaryTrackHoverOnly(this.trackStates[track].dt);
+        return this.trackStates[track]?.dt.dictionaryColorizeOnHoverOnly;
     }
 
-    private _tokenStatusValid(tokenStatus: TokenStatus | undefined | null) {
-        if (tokenStatus === undefined || tokenStatus === null) return false;
-        if (tokenStatus === TokenStatus.UNCOLLECTED) return !this.uncollectedNeedsRefresh;
-        return true;
-    }
+    async saveTokenLocal(
+        track: number,
+        token: string,
+        status: TokenStatus | null,
+        states: TokenState[],
+        applyStates: ApplyStrategy
+    ): Promise<void> {
+        if (this.profile === null) return;
+        const profile = this.profile;
+        const ts = this.trackStates[track];
+        if (!ts || !dictionaryTrackEnabled(ts.dt) || !ts.yt) return;
 
-    private _colorCacheValid(cachedRichText: string | undefined, index: number) {
-        if (cachedRichText === undefined) return false;
-        if (this.erroredCache.has(index)) return false;
-        if (this.uncollectedCache.has(index)) return !this.uncollectedNeedsRefresh;
-        return true;
-    }
-
-    private async _updateAnkiCache() {
-        if (!this.anki) return;
-        for (const ts of this.trackStates) {
-            if (!dictionaryTrackEnabled(ts.dt)) continue;
-            const fields = [...ts.dt.dictionaryAnkiWordFields, ...ts.dt.dictionaryAnkiSentenceFields]
-                .map((field) => `"${field}:_*"`)
-                .join(' OR ');
-            ts.ankiSuspendedCardIds = new Set(await this.anki.findCards(`is:suspended (${fields})`));
-            const prop = (await this.anki.findCards(`prop:s>=0 (${fields})`)).length ? 'prop:s' : 'prop:ivl'; // No cards are returned if FSRS is disabled
-            const graduatedCutoff = Math.ceil(ts.dt.dictionaryAnkiMatureCutoff / 2);
-            const matureCutoff = ts.dt.dictionaryAnkiMatureCutoff;
-
-            // AnkiConnect doesn't expose Stability but we can retrieve it using search queries, stability is undefined for new cards
-            ts.ankiCardIdStatuses = new Map<number, TokenStatus>();
-            (await this.anki.findCards(`is:new (${fields})`)).forEach((c) =>
-                ts.ankiCardIdStatuses.set(c, TokenStatus.UNKNOWN)
-            );
-            (await this.anki.findCards(`is:learn (${fields})`)).forEach((c) =>
-                ts.ankiCardIdStatuses.set(c, TokenStatus.LEARNING)
-            );
-            (await this.anki.findCards(`-is:new -is:learn ${prop}<${graduatedCutoff} (${fields})`)).forEach((c) =>
-                ts.ankiCardIdStatuses.set(c, TokenStatus.GRADUATED)
-            );
-            (await this.anki.findCards(`${prop}>=${graduatedCutoff} ${prop}<${matureCutoff} (${fields})`)).forEach(
-                (c) => ts.ankiCardIdStatuses.set(c, TokenStatus.YOUNG)
-            );
-            (await this.anki.findCards(`${prop}>=${matureCutoff} (${fields})`)).forEach((c) =>
-                ts.ankiCardIdStatuses.set(c, TokenStatus.MATURE)
-            );
-        }
+        const lemmas = await ts.yt.lemmatize(token);
+        await this.dictionaryProvider.saveRecordLocalBulk(profile, [{ token, status, lemmas, states }], applyStates);
+        this.tokensForRefresh.add(token);
+        for (const lemma of lemmas) this.tokensForRefresh.add(lemma);
     }
 
     private async _checkAnkiRecentlyModifiedCards() {
-        if (!this.anki || !this.trackStates.length) return;
+        if (this.profile === null || !this.trackStates.length) return;
+        const profile = this.profile;
 
         const allFieldsSet: Set<string> = new Set();
         for (const ts of this.trackStates) {
-            if (!dictionaryTrackEnabled(ts.dt)) continue;
-            [...ts.dt.dictionaryAnkiWordFields, ...ts.dt.dictionaryAnkiSentenceFields].forEach((field) =>
-                allFieldsSet.add(field)
-            );
+            if (!dictionaryStatusCollectionEnabled(ts.dt)) continue;
+            for (const field of ts.dt.dictionaryAnkiWordFields.concat(ts.dt.dictionaryAnkiSentenceFields)) {
+                allFieldsSet.add(field);
+            }
         }
         if (!allFieldsSet.size) return;
         const allFields = Array.from(allFieldsSet);
 
+        const options = { useOriginTab: true }; // We don't have the full extension context if in a page script
+        if (!this.anki) {
+            try {
+                this.anki = new Anki(await this.settingsProvider.getAll(), this.fetcher);
+                const permission = (await this.anki.requestPermission()).permission;
+                if (permission !== 'granted') throw new Error(`permission ${permission}`);
+                await this.dictionaryProvider.buildAnkiCache(profile, await this.settingsProvider.getAll(), options); // Keep cache updated without user action
+            } catch (e) {
+                console.warn('Anki permission request failed:', e);
+                this.anki = undefined;
+                return;
+            }
+        }
+
         try {
-            const cardIds = await this.anki.findRecentlyEditedCards(allFields, 1); // Don't care about rated:1 or suspended status
-            if (cardIds.every((cardId) => this.ankiRecentlyModifiedCardIds.has(cardId))) {
-                if (this.ankiRecentlyModifiedCardIds.size !== cardIds.length) {
-                    this.ankiRecentlyModifiedCardIds = new Set(cardIds);
-                }
+            const cardIds = await this.anki.findRecentlyEditedOrReviewedCards(allFields, 1); // Can't efficiently poll suspended status
+            if (
+                cardIds.length === this.ankiRecentlyModifiedCardIds.size &&
+                cardIds.every((cardId) => this.ankiRecentlyModifiedCardIds.has(cardId))
+            ) {
+                if (this.ankiRecentlyModifiedFirstCheck) this.ankiRecentlyModifiedFirstCheck = false;
                 return;
             }
             this.ankiRecentlyModifiedCardIds = new Set(cardIds);
@@ -198,14 +374,29 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
                 this.ankiRecentlyModifiedFirstCheck = false;
                 return;
             }
-            this.uncollectedNeedsRefresh = true;
-            await this._updateAnkiCache();
+            await this.dictionaryProvider.buildAnkiCache(profile, await this.settingsProvider.getAll(), options);
         } catch (e) {
             console.error(`Error checking Anki recently modified cards:`, e);
+            this.anki = undefined;
+            this.ankiRecentlyModifiedCardIds.clear();
+            this.ankiRecentlyModifiedFirstCheck = false;
         }
     }
 
     bind() {
+        if (this.removeBuildAnkiCacheStateChangeCB) this.removeBuildAnkiCacheStateChangeCB();
+        this.removeBuildAnkiCacheStateChangeCB = this.dictionaryProvider.onBuildAnkiCacheStateChange((state) => {
+            this.tokensWereModified(state.body?.modifiedTokens ?? []);
+            if (state.type === DictionaryBuildAnkiCacheStateType.error) {
+                const body = state.body as DictionaryBuildAnkiCacheStateError;
+                console.warn(`Dictionary Anki cache build error: ${body.msg}`);
+                this.ankiRecentlyModifiedCardIds.clear();
+                this.ankiRecentlyModifiedFirstCheck = false;
+            }
+        });
+        if (this.removeAnkiCardModifiedCB) this.removeAnkiCardModifiedCB();
+        this.removeAnkiCardModifiedCB = this.dictionaryProvider.onAnkiCardModified(() => this.ankiCardWasModified());
+
         this.subtitlesInterval = setInterval(() => {
             if (!this._subtitles.length) return;
 
@@ -220,37 +411,46 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
                     if (
                         slice.showing.some(
                             (s) =>
-                                !this._subtitles[s.index].richText &&
+                                !this._subtitles[s.index].__tokenized &&
                                 !this.colorCacheBuildingCurrentIndexes.has(s.index)
                         )
                     ) {
-                        if (this.colorCacheBuilding) this.shouldCancelBuild = true;
+                        if (this.colorCacheBuilding && this.initialized) this.shouldCancelBuild = true;
                     }
                 }
                 if (this.showingNeedsRefreshCount) {
-                    const { colorBufferStartIndex, colorBufferEndIndex } = this._getColorBufferIndexes(slice.showing);
-                    void this._buildColorCache(this._subtitles.slice(colorBufferStartIndex, colorBufferEndIndex)).then(
-                        (res) => {
-                            if (res) this.showingNeedsRefreshCount = Math.max(0, this.showingNeedsRefreshCount - 1);
-                        }
+                    const { colorBufferStartIndex, colorBufferEndIndex } = this._getColorBufferIndexes(
+                        false,
+                        slice.showing
                     );
+                    void this._buildColorCache(colorBufferStartIndex, colorBufferEndIndex).then((res) => {
+                        if (res) this.showingNeedsRefreshCount = Math.max(0, this.showingNeedsRefreshCount - 1);
+                    });
                     this.colorCacheLastRefresh = Date.now();
                     return;
                 }
             }
-            if (Date.now() - this.colorCacheLastRefresh >= TOKEN_CACHE_ERROR_REFRESH_INTERVAL) {
-                void this._initColorCache();
+            if (
+                this.tokensForRefresh.size || // Don't force a build for this.refreshCache.size as it may update too frequently for token.frequency
+                Date.now() - this.colorCacheLastRefresh >= TOKEN_CACHE_ERROR_REFRESH_INTERVAL
+            ) {
+                const { colorBufferStartIndex, colorBufferEndIndex } = this._getColorBufferIndexes();
+                void this._buildColorCache(colorBufferStartIndex, colorBufferEndIndex);
                 this.colorCacheLastRefresh = Date.now();
             }
-            if (Date.now() - this.ankiLastRecentlyModifiedCheck >= ANKI_RECENTLY_MODIFIED_INTERVAL) {
+            if (
+                this.ankiRecentlyModifiedTrigger ||
+                Date.now() - this.ankiLastRecentlyModifiedCheck >= ANKI_RECENTLY_MODIFIED_INTERVAL
+            ) {
                 void this._checkAnkiRecentlyModifiedCards();
                 this.ankiLastRecentlyModifiedCheck = Date.now();
+                this.ankiRecentlyModifiedTrigger = false;
             }
         }, 100);
     }
 
-    private _getColorBufferIndexes(subtitles?: RichSubtitleModel[]) {
-        if (!subtitles) {
+    private _getColorBufferIndexes(init?: boolean, subtitles?: RichSubtitleModel[]) {
+        if (!subtitles?.length) {
             if (this.getMediaTimeMs) {
                 const slice = this.subtitlesAt(this.getMediaTimeMs());
                 subtitles = slice.showing;
@@ -259,110 +459,140 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
                 return { colorBufferStartIndex: 0, colorBufferEndIndex: this._subtitles.length };
             }
         }
-        if (!subtitles.length) return { colorBufferStartIndex: 0, colorBufferEndIndex: TOKEN_CACHE_BUILD_AHEAD };
+        const tokenCacheBuildAhead = init ? TOKEN_CACHE_BUILD_AHEAD_INIT : TOKEN_CACHE_BUILD_AHEAD;
+        if (!subtitles.length) return { colorBufferStartIndex: 0, colorBufferEndIndex: tokenCacheBuildAhead };
         const colorBufferStartIndex = Math.min(...subtitles.map((s) => s.index));
-        const colorBufferEndIndex = Math.max(...subtitles.map((s) => s.index)) + 1 + TOKEN_CACHE_BUILD_AHEAD;
+        const colorBufferEndIndex = Math.max(...subtitles.map((s) => s.index)) + 1 + tokenCacheBuildAhead;
         return { colorBufferStartIndex, colorBufferEndIndex };
     }
 
-    private _initColorCache(): Promise<boolean> {
-        const { colorBufferStartIndex, colorBufferEndIndex } = this._getColorBufferIndexes();
-        return this._buildColorCache(this._subtitles.slice(colorBufferStartIndex, colorBufferEndIndex));
-    }
-
-    private async _buildColorCache(subtitles: RichSubtitleModel[]): Promise<boolean> {
-        if (!subtitles.length) return true;
-        if (!this.trackStates.length) {
-            if (!this.settings) {
-                const settings = await this.initialSettings;
-                if (!this.settings) this.settings = settings;
-            }
-            this.trackStates = this.settings!.dictionaryTracks.map((dt, track) => ({
-                track,
-                dt,
-                yt: undefined,
-                tokenStatusCache: new Map(),
-                ankiCardIdStatuses: new Map(),
-                ankiSuspendedCardIds: new Set(),
-            }));
-        }
-        if (this.trackStates.every((t) => !dictionaryTrackEnabled(t.dt))) return true;
+    private async _buildColorCache(
+        colorBufferStartIndex: number,
+        colorBufferEndIndex: number,
+        init?: boolean
+    ): Promise<boolean> {
         if (this.colorCacheBuilding) return false;
-
-        let uncollectedWasRefreshed = false;
+        let tokensRefreshed: string[] = [];
         let buildWasCancelled = false;
+        let updateThresholds = false;
         try {
             this.colorCacheBuilding = true;
-            this.tokenRequestFailed = false;
+            const subtitles = this._subtitles.slice(colorBufferStartIndex, colorBufferEndIndex);
+            if (!subtitles.length) return true;
+            if (this.profile === null) {
+                const profile = (await this.settingsProvider.activeProfile())?.name;
+                if (this.profile === null) {
+                    this.profile = profile;
+                    this.ankiRecentlyModifiedTrigger = true;
+                }
+            }
+            const profile = this.profile;
+            if (!this.trackStates.length) {
+                this.trackStates = (await this.settingsProvider.getSingle('dictionaryTracks')).map((dt, track) => ({
+                    track,
+                    dt,
+                    yt: undefined,
+                    collectedExactForm: new Map(),
+                    collectedLemmaForm: new Map(),
+                    collectedAnyForm: new Map(),
+                    tokenStates: new Map(),
+                }));
+            }
+            if (this.trackStates.every((t) => !dictionaryTrackEnabled(t.dt))) return true;
+
             for (const ts of this.trackStates) {
                 if (!dictionaryTrackEnabled(ts.dt) || ts.yt) continue;
                 try {
-                    const yt = new Yomitan(ts.dt, this.fetcher);
+                    const yt = new Yomitan(ts.dt, this.fetcher, (token) => {
+                        for (const index of this.tokenToIndexesCache.get(token) ?? []) this.refreshCache.add(index);
+                    });
                     await yt.version();
                     ts.yt = yt;
                 } catch (e) {
                     console.warn(`YomitanTrack${ts.track + 1} version request failed:`, e);
                 }
             }
-            if (!this.anki && this.trackStates.some((t) => dictionaryTrackEnabled(t.dt))) {
-                try {
-                    this.anki = new Anki(this.settings!, this.fetcher);
-                    const permission = (await this.anki.requestPermission()).permission;
-                    if (permission !== 'granted') throw new Error(`permission ${permission}`);
-                    await this._updateAnkiCache();
-                } catch (e) {
-                    console.warn('Anki permission request failed:', e);
-                    this.anki = undefined;
-                }
-            }
 
-            if (this.uncollectedNeedsRefresh) {
-                uncollectedWasRefreshed = true;
-                this.anki?.resetCache(); // If a new card was added, it could be for any token
+            if (this.refreshCache.size || this.tokensForRefresh.size) {
                 const existingIndexes = new Set(subtitles.map((s) => s.index));
-                const newSubtitles = subtitles.slice();
-                for (const index of this.uncollectedCache) {
-                    if (existingIndexes.has(index)) continue;
-                    newSubtitles.push(this._subtitles[index]); // Process all uncollected subtitles even if not in buffer
+                for (const token of this.tokensForRefresh) {
+                    tokensRefreshed.push(token);
+                    for (const index of this.tokenToIndexesCache.get(token) ?? []) this.refreshCache.add(index);
                 }
-                subtitles = newSubtitles;
+                for (const index of this.refreshCache) {
+                    if (existingIndexes.has(index)) continue;
+                    existingIndexes.add(index);
+                    subtitles.push(this._subtitles[index]); // Process all relevant subtitles even if not in buffer
+                }
+            } else if (!subtitles.some((s) => this.erroredCache.has(s.index))) {
+                if (
+                    colorBufferStartIndex >= this.buildLowerThreshold &&
+                    colorBufferStartIndex < this.buildUpperThreshold
+                ) {
+                    return true;
+                }
+                updateThresholds = true;
             }
 
-            const eventsPerTrack = new Map<number, string[]>();
-            for (const { text, track } of subtitles) {
-                if (!eventsPerTrack.has(track)) eventsPerTrack.set(track, []);
-                eventsPerTrack.get(track)!.push(text);
+            try {
+                for (const subtitle of subtitles) this.colorCacheBuildingCurrentIndexes.add(subtitle.index);
+                await this._buildTokenAndLemmaMap(profile, subtitles);
+            } finally {
+                this.colorCacheBuildingCurrentIndexes.clear();
             }
-            for (const [track, texts] of eventsPerTrack.entries()) {
-                const ts = this.trackStates[track];
-                if (!dictionaryTrackEnabled(ts.dt)) continue;
-                if (!ts.yt?.supportsConcurrentTokenization) continue;
-                await ts.yt.cacheTokenizations(texts);
-            }
-            eventsPerTrack.clear();
 
             await inBatches(
                 subtitles,
                 async (batch) => {
                     await Promise.all(
-                        batch.map(async ({ index, text, track }) => {
+                        batch.map(async ({ index, text, track, __tokenized: alreadyTokenized }) => {
                             if (this.shouldCancelBuild) return;
+                            if (alreadyTokenized && !this.refreshCache.has(index) && !this.erroredCache.has(index)) {
+                                return;
+                            }
+                            const ts = this.trackStates[track];
+                            if (!dictionaryTrackEnabled(ts.dt)) return;
+                            const deletedFromRefreshCache = this.refreshCache.delete(index);
+                            const deletedFromErroredCache = this.erroredCache.delete(index);
                             try {
                                 this.colorCacheBuildingCurrentIndexes.add(index);
-                                const ts = this.trackStates[track];
-                                if (!dictionaryTrackEnabled(ts.dt)) return;
-                                const cachedRichText = this._subtitles[index].richText;
-                                if (this._colorCacheValid(cachedRichText, index)) return;
-                                const richText = await this._colorizeText({ text, index, ts });
-                                if (cachedRichText === richText) return;
+                                const existingTokenization = this._subtitles[index].tokenization;
+                                const tokenizationModel = !existingTokenization
+                                    ? await this._tokenizationModel(text, index, ts)
+                                    : await this._tokenizationModelMergedWithExistingOne(
+                                          text,
+                                          existingTokenization,
+                                          index,
+                                          ts
+                                      );
                                 if (this.shouldCancelBuild) return;
-                                const updatedSubtitles: RichSubtitleModel[] = [];
-                                if (richText) {
-                                    this._subtitles[index].richText = richText;
-                                    updatedSubtitles.push(this._subtitles[index]);
+                                if (areTokenizationsEqual(tokenizationModel?.tokenization, existingTokenization)) {
+                                    return;
                                 }
-                                this.subtitleColorsUpdated(updatedSubtitles);
+                                const updatedSubtitles: RichSubtitleModel[] = [];
+                                if (tokenizationModel) {
+                                    const { tokenization, reconstructedText } = tokenizationModel;
+                                    const subtitle = this._subtitles[index];
+                                    subtitle.tokenization = tokenization;
+                                    subtitle.richText = undefined;
+                                    if (subtitle.originalText === undefined) subtitle.originalText = subtitle.text;
+                                    subtitle.text = reconstructedText;
+                                    subtitle.__tokenized = true;
+                                    updatedSubtitles.push(subtitle);
+                                }
+                                this.subtitleColorsUpdated(
+                                    updatedSubtitles,
+                                    this.trackStates.map((ts) => ts.dt)
+                                );
+                            } catch (e) {
+                                console.error(`Error building color cache for subtitle index ${index}:`, e);
+                                if (deletedFromRefreshCache) this.refreshCache.add(index);
+                                else this.erroredCache.add(index);
                             } finally {
+                                if (this.shouldCancelBuild) {
+                                    if (deletedFromRefreshCache) this.refreshCache.add(index);
+                                    else if (deletedFromErroredCache) this.erroredCache.add(index);
+                                }
                                 this.colorCacheBuildingCurrentIndexes.delete(index);
                             }
                         })
@@ -372,446 +602,790 @@ export class SubtitleColoring extends SubtitleCollection<RichSubtitleModel> {
             );
             if (this.shouldCancelBuild) {
                 buildWasCancelled = true;
-                uncollectedWasRefreshed = false;
+                tokensRefreshed = [];
+                updateThresholds = false;
             }
         } finally {
-            if (this.tokenRequestFailed) {
-                this.tokenRequestFailed = false;
-                this.trackStates.forEach((ts) => (ts.yt = undefined));
-                this.anki = undefined;
+            if (this.tokenRequestFailedForTracks.size) {
+                tokensRefreshed = [];
+                updateThresholds = false;
+                for (const track of this.tokenRequestFailedForTracks) resetYomitan(this.trackStates[track]);
+                this.tokenRequestFailedForTracks.clear();
+            } else if (!this.shouldCancelBuild) {
+                this.initialized = true;
             }
-            if (uncollectedWasRefreshed) this.uncollectedNeedsRefresh = false;
+            if (updateThresholds && !init) {
+                this.buildUpperThreshold = colorBufferEndIndex - TOKEN_CACHE_BUILD_AHEAD_THRESHOLD;
+                this.buildLowerThreshold = colorBufferStartIndex; // Build whenever the user seeks backwards
+            }
+            if (
+                tokensRefreshed.length === this.tokensForRefresh.size &&
+                tokensRefreshed.every((token) => this.tokensForRefresh.has(token))
+            ) {
+                this.tokensForRefresh.clear();
+            }
             this.shouldCancelBuild = false;
             this.colorCacheBuilding = false;
         }
         return !buildWasCancelled;
     }
 
-    private async _colorizeText(options: { text: string; index: number; ts: TrackState }): Promise<string | undefined> {
-        const { text, index, ts } = options;
-        try {
-            if (!this.anki) throw new Error('Anki not initialized');
-            if (!ts.yt) throw new Error(`Yomitan not initialized for Track${ts.track + 1}`);
-            if (!ts.dt.dictionaryAnkiWordFields.length && !ts.dt.dictionaryAnkiSentenceFields.length) {
-                throw new Error('No Anki fields defined');
-            }
+    private async _buildTokenAndLemmaMap(profile: string | undefined, subtitles: RichSubtitleModel[]): Promise<void> {
+        const eventsPerTrack = new Map<number, string[]>();
+        for (const subtitle of subtitles) {
+            const eventsForTrack = eventsPerTrack.get(subtitle.track);
+            if (eventsForTrack) eventsForTrack.push(subtitle.text);
+            else eventsPerTrack.set(subtitle.track, [subtitle.text]);
+        }
 
-            let richText: string = '';
-            let textHasError = false;
-            let textHasUncollected = false;
-            const tokenizeRes = await ts.yt.tokenize(text);
-            if (this.shouldCancelBuild) return;
-            for (const rawTokenParts of tokenizeRes) {
-                const trimmedToken = rawTokenParts
-                    .map((p) => p.text)
-                    .join('')
-                    .trim();
+        for (const [track, texts] of eventsPerTrack.entries()) {
+            const ts = this.trackStates[track];
+            try {
+                if (!ts.yt) continue;
+                const tokenizeBulkRes = await ts.yt.tokenizeBulk(texts);
+                if (!dictionaryStatusCollectionEnabled(ts.dt)) continue; // Still want to bulk tokenize if TokenReadingAnnotation.ALWAYS but no coloring
+                if (this.shouldCancelBuild) return;
 
-                // Token is already cached or not a word
-                const cachedTokenStatus = ts.tokenStatusCache.get(trimmedToken);
-                if (this._tokenStatusValid(cachedTokenStatus)) {
-                    richText += this._applyTokenStyle({ rawTokenParts, tokenStatus: cachedTokenStatus!, dt: ts.dt });
-                    if (cachedTokenStatus === TokenStatus.UNCOLLECTED) textHasUncollected = true;
-                    else if (cachedTokenStatus === null) textHasError = true;
-                    continue;
-                }
-                if (!HAS_LETTER_REGEX.test(trimmedToken)) {
-                    const fullyKnownTokenStatus = getFullyKnownTokenStatus();
-                    richText += this._applyTokenStyle({ rawTokenParts, tokenStatus: fullyKnownTokenStatus, dt: ts.dt });
-                    ts.tokenStatusCache.set(trimmedToken, fullyKnownTokenStatus);
-                    continue;
+                const shouldQueryExactForm =
+                    shouldUseExactForm(ts.dt.dictionaryTokenMatchStrategy) ||
+                    shouldUseExactForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy);
+                const shouldQueryLemmaForm =
+                    shouldUseLemmaForm(ts.dt.dictionaryTokenMatchStrategy) ||
+                    shouldUseLemmaForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy);
+                const shouldQueryAnyForm =
+                    shouldUseAnyForm(ts.dt.dictionaryTokenMatchStrategy) ||
+                    shouldUseAnyForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy);
+
+                for (const token of this.tokensForRefresh) {
+                    ts.collectedExactForm.delete(token);
+                    ts.collectedLemmaForm.delete(token);
+                    ts.collectedAnyForm.delete(token);
+                    ts.tokenStates.delete(token);
                 }
 
-                let tokenStatus: TokenStatus | null = null;
-                switch (ts.dt.dictionaryTokenMatchStrategyPriority) {
-                    case TokenMatchStrategyPriority.EXACT:
-                        tokenStatus = await this._handlePriorityExact({ trimmedToken, ts });
-                        break;
-                    case TokenMatchStrategyPriority.LEMMA:
-                        tokenStatus = await this._handlePriorityLemma({ trimmedToken, ts });
-                        break;
-                    case TokenMatchStrategyPriority.BEST_KNOWN:
-                        tokenStatus = await this._handlePriorityKnown({
-                            trimmedToken,
-                            ts,
-                            cmp: (a, b) => (a > b ? a : b),
-                        });
-                        break;
-                    case TokenMatchStrategyPriority.LEAST_KNOWN:
-                        tokenStatus = await this._handlePriorityKnown({
-                            trimmedToken,
-                            ts,
-                            cmp: (a, b) => (a < b ? a : b),
-                        });
-                        break;
-                    default:
-                        throw new Error(`Unknown strategy priority: ${ts.dt.dictionaryTokenMatchStrategyPriority}`);
+                const forExactFormQuery = new Set<string>();
+                const forLemmaFormQuery = new Set<string>();
+                const forAnyFormQuery = new Set<string>();
+                for (const tokenParts of tokenizeBulkRes) {
+                    const token = tokenParts
+                        .map((p) => p.text)
+                        .join('')
+                        .trim();
+                    if (shouldQueryExactForm && !ts.collectedExactForm.has(token)) forExactFormQuery.add(token);
+                    if (shouldQueryLemmaForm) {
+                        for (const lemma of await ts.yt.lemmatize(token)) {
+                            if (!ts.collectedLemmaForm.has(lemma)) forLemmaFormQuery.add(lemma);
+                        }
+                    }
+                    if (shouldQueryAnyForm) {
+                        for (const lemma of await ts.yt.lemmatize(token)) {
+                            if (!ts.collectedAnyForm.has(lemma)) forAnyFormQuery.add(lemma);
+                        }
+                    }
                 }
                 if (this.shouldCancelBuild) return;
 
-                richText += this._applyTokenStyle({ rawTokenParts, tokenStatus, dt: ts.dt });
-                if (tokenStatus === TokenStatus.UNCOLLECTED) textHasUncollected = true;
-                else if (tokenStatus === null) textHasError = true;
-                ts.tokenStatusCache.set(trimmedToken, tokenStatus);
-            }
+                const [exactFormResultMap, lemmaFormResultMap, anyFormResultsMap] = await Promise.all([
+                    forExactFormQuery.size
+                        ? this.dictionaryProvider.getBulk(profile, track, Array.from(forExactFormQuery))
+                        : ({} as TokenResults),
+                    forLemmaFormQuery.size
+                        ? this.dictionaryProvider.getBulk(profile, track, Array.from(forLemmaFormQuery))
+                        : ({} as TokenResults),
+                    forAnyFormQuery.size
+                        ? this.dictionaryProvider.getByLemmaBulk(profile, track, Array.from(forAnyFormQuery))
+                        : ({} as LemmaResults),
+                ]);
+                if (this.shouldCancelBuild) return;
 
-            textHasError ? this.erroredCache.add(index) : this.erroredCache.delete(index);
-            textHasUncollected ? this.uncollectedCache.add(index) : this.uncollectedCache.delete(index);
-            return richText;
-        } catch (error) {
-            this.tokenRequestFailed = true;
-            console.error(`Error colorizing subtitle text for Track${ts.track + 1}:`, error);
-            this.erroredCache.add(index);
-            return text
-                .split('\n')
-                .map((line) =>
-                    this._applyTokenStyle({
-                        rawTokenParts: [{ text: line, reading: '' }],
-                        tokenStatus: null,
-                        dt: ts.dt,
-                    })
-                )
-                .join('\n');
-        }
-    }
-
-    private async _handlePriorityExact(options: { trimmedToken: string; ts: TrackState }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts } = options;
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getWordFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: !ts.dt.dictionaryAnkiSentenceFields.length,
-                getFieldColor: (tokenLemma) => this._getWordFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getSentenceFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: true,
-                getFieldColor: (tokenLemma) => this._getSentenceFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        return TokenStatus.UNCOLLECTED;
-    }
-
-    private async _handlePriorityLemma(options: { trimmedToken: string; ts: TrackState }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts } = options;
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: !ts.dt.dictionaryAnkiSentenceFields.length,
-                getFieldColor: (tokenLemma) => this._getWordFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getWordFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: true,
-                getFieldColor: (tokenLemma) => this._getSentenceFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getSentenceFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) return tokenStatus;
-        }
-        return TokenStatus.UNCOLLECTED;
-    }
-
-    private async _handlePriorityKnown(options: {
-        trimmedToken: string;
-        ts: TrackState;
-        cmp: (a: TokenStatus, b: TokenStatus) => TokenStatus;
-    }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts, cmp } = options;
-        let tokenStatusExact: TokenStatus = TokenStatus.UNCOLLECTED;
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getWordFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus === null) return tokenStatus;
-            tokenStatusExact = tokenStatus;
-        }
-        let tokenStatusLemma: TokenStatus = TokenStatus.UNCOLLECTED;
-        if (ts.dt.dictionaryTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: !ts.dt.dictionaryAnkiSentenceFields.length,
-                getFieldColor: (tokenLemma) => this._getWordFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus === null) return tokenStatus;
-            tokenStatusLemma = tokenStatus;
-        }
-        if (tokenStatusExact !== TokenStatus.UNCOLLECTED || tokenStatusLemma !== TokenStatus.UNCOLLECTED) {
-            return cmp(tokenStatusExact, tokenStatusLemma);
-        }
-
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.LEMMA_FORM_COLLECTED) {
-            const tokenStatus = await this._getSentenceFieldColor({ trimmedToken, ts });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus === null) return tokenStatus;
-            tokenStatusExact = tokenStatus;
-        }
-        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.EXACT_FORM_COLLECTED) {
-            const tokenStatus = await this._handleLemmatize({
-                trimmedToken,
-                ts,
-                cacheUncollected: true,
-                getFieldColor: (tokenLemma) => this._getSentenceFieldColor({ trimmedToken: tokenLemma, ts }),
-            });
-            if (this.shouldCancelBuild) return null;
-            if (tokenStatus === null) return tokenStatus;
-            tokenStatusLemma = tokenStatus;
-        }
-        return cmp(tokenStatusExact, tokenStatusLemma);
-    }
-
-    private async _handleLemmatize(options: {
-        trimmedToken: string;
-        ts: TrackState;
-        cacheUncollected: boolean;
-        getFieldColor: (tokenLemma: string) => Promise<TokenStatus | null>;
-    }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts, cacheUncollected, getFieldColor } = options;
-
-        const tokenLemmas = await ts.yt!.lemmatize(trimmedToken);
-        if (this.shouldCancelBuild) return null;
-        for (const tokenLemma of tokenLemmas) {
-            const cachedTokenLemma = ts.tokenStatusCache.get(tokenLemma);
-            if (this._tokenStatusValid(cachedTokenLemma)) return cachedTokenLemma!;
-            const tokenStatus = await getFieldColor(tokenLemma);
-            if (tokenStatus !== TokenStatus.UNCOLLECTED) {
-                ts.tokenStatusCache.set(tokenLemma, tokenStatus);
-                return tokenStatus;
-            }
-            if (cacheUncollected && tokenLemma !== trimmedToken) {
-                ts.tokenStatusCache.set(tokenLemma, TokenStatus.UNCOLLECTED);
-            }
-            if (this.shouldCancelBuild) return null;
-        }
-        return TokenStatus.UNCOLLECTED;
-    }
-
-    private async _getWordFieldColor(options: { trimmedToken: string; ts: TrackState }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts } = options;
-        try {
-            if (!this.anki) throw new Error('Anki not initialized');
-            let cardIds = await this.anki.findCardsWithWord(ts.track, trimmedToken, ts.dt.dictionaryAnkiWordFields);
-            if (!cardIds.length) return TokenStatus.UNCOLLECTED;
-            if (this.shouldCancelBuild) return null;
-            return this._getTokenStatusFromCutoff({ cardIds, ts });
-        } catch (error) {
-            this.tokenRequestFailed = true;
-            console.error(
-                `Error getting color for Track${ts.track + 1} using word fields for token "${trimmedToken}":`,
-                error
-            );
-            return null;
-        }
-    }
-
-    private async _getSentenceFieldColor(options: {
-        trimmedToken: string;
-        ts: TrackState;
-    }): Promise<TokenStatus | null> {
-        const { trimmedToken, ts } = options;
-        try {
-            if (!this.anki) throw new Error('Anki not initialized');
-            let cardIds = await this.anki.findCardsContainingWord(
-                ts.track,
-                trimmedToken,
-                ts.dt.dictionaryAnkiSentenceFields
-            );
-            if (this.shouldCancelBuild) return null;
-            const suspendedRes = this._handleSuspendedCards({ cardIds, ts });
-            if (!(suspendedRes instanceof Array)) return suspendedRes;
-            cardIds = this._limitCardIds({ cardIds: suspendedRes, ts });
-            if (!cardIds.length) return TokenStatus.UNCOLLECTED;
-            const rawCardInfos = await this.anki.cardsInfo(cardIds);
-            if (!rawCardInfos.length) return null;
-            if (this.shouldCancelBuild) return null;
-
-            if (ts.yt?.supportsConcurrentTokenization) {
-                const sentenceFieldValues: string[] = [];
-                for (const sentenceField of ts.dt.dictionaryAnkiSentenceFields) {
-                    for (const cardInfo of rawCardInfos) {
-                        const field = cardInfo.fields[sentenceField];
-                        if (!field) continue;
-                        sentenceFieldValues.push(field.value);
+                for (const [token, { states, statuses, source }] of Object.entries(exactFormResultMap)) {
+                    const status = this._getTokenStatus(statuses, ts);
+                    ts.collectedExactForm.set(token, { status, source });
+                    if (states.length) ts.tokenStates.set(token, states);
+                }
+                for (const [lemma, { states, statuses, source }] of Object.entries(lemmaFormResultMap)) {
+                    const status = this._getTokenStatus(statuses, ts);
+                    ts.collectedLemmaForm.set(lemma, { status, source });
+                    if (!states.length) continue;
+                    const tokenStates = ts.tokenStates.get(lemma);
+                    if (tokenStates) {
+                        for (const state of states) {
+                            if (!tokenStates.includes(state)) tokenStates.push(state);
+                        }
+                    } else {
+                        ts.tokenStates.set(lemma, states);
                     }
                 }
-                await ts.yt.cacheTokenizations(sentenceFieldValues);
-            }
-
-            // Tokenize the sentence field and filter cards that actually contain the token
-            const validCardInfos = await filterAsync(
-                rawCardInfos,
-                async (cardInfo: any) => {
-                    for (const sentenceField of ts.dt.dictionaryAnkiSentenceFields) {
-                        const field = cardInfo.fields[sentenceField];
-                        if (!field) continue;
-                        const fieldTokens = (await ts.yt!.tokenize(field.value)).map((t) =>
-                            t
-                                .map((p) => p.text)
-                                .join('')
-                                .trim()
-                        );
-                        if (this.shouldCancelBuild) return false;
-                        if (fieldTokens.includes(trimmedToken)) return true;
-                        if (ts.dt.dictionaryAnkiSentenceTokenMatchStrategy !== TokenMatchStrategy.ANY_FORM_COLLECTED) {
-                            continue;
-                        }
-                        for (const fieldToken of fieldTokens) {
-                            const fieldTokenLemmas = await ts.yt!.lemmatize(fieldToken);
-                            if (this.shouldCancelBuild) return false;
-                            if (fieldTokenLemmas.includes(trimmedToken)) return true;
+                for (const [lemma, lemmaResults] of Object.entries(anyFormResultsMap)) {
+                    for (const { states, statuses, source, token } of lemmaResults) {
+                        const status = this._getTokenStatus(statuses, ts);
+                        const lemmaCollected = ts.collectedAnyForm.get(lemma);
+                        if (lemmaCollected) lemmaCollected.push({ status, source, token });
+                        else ts.collectedAnyForm.set(lemma, [{ status, source, token }]);
+                        if (!states.length) continue;
+                        const tokenStates = ts.tokenStates.get(token);
+                        if (tokenStates) {
+                            for (const state of states) {
+                                if (!tokenStates.includes(state)) tokenStates.push(state);
+                            }
+                        } else {
+                            ts.tokenStates.set(token, states);
                         }
                     }
-                    return false;
-                },
-                { batchSize: TOKEN_CACHE_BATCH_SIZE }
-            );
-            if (this.shouldCancelBuild) return null;
-            if (!validCardInfos.length) return TokenStatus.UNCOLLECTED;
-            return this._getTokenStatusFromCutoff({ cardIds: validCardInfos.map((cardInfo) => cardInfo.cardId), ts });
-        } catch (error) {
-            this.tokenRequestFailed = true;
-            console.error(
-                `Error getting color for Track${ts.track + 1} using sentence fields for token "${trimmedToken}":`,
-                error
-            );
-            return null;
-        }
-    }
-
-    private _limitCardIds(options: { cardIds: number[]; ts: TrackState }): number[] {
-        const { cardIds, ts } = options;
-        if (cardIds.length <= MAX_CARD_INFOS) return cardIds;
-
-        const length = getFullyKnownTokenStatus() + 1;
-        const buckets: number[][] = Array.from({ length }, () => []);
-        for (const cardId of cardIds) {
-            buckets[ts.ankiCardIdStatuses.get(cardId) ?? TokenStatus.UNCOLLECTED].push(cardId);
-        }
-
-        const limitedCardIds: number[] = [];
-        for (let status = length - 1; status >= 0; status--) {
-            for (const cardId of buckets[status]) {
-                limitedCardIds.push(cardId);
-                if (limitedCardIds.length >= MAX_CARD_INFOS) return limitedCardIds;
+                }
+            } catch (e) {
+                console.error(`Error building token and lemma map for track ${track}:`, e);
+                resetYomitan(ts);
             }
         }
-        return limitedCardIds;
     }
 
-    private _handleSuspendedCards(options: { cardIds: number[]; ts: TrackState }): number[] | TokenStatus {
-        const { cardIds, ts } = options;
-        if (!cardIds.length || ts.dt.dictionaryAnkiTreatSuspended === 'NORMAL') return cardIds;
-        const unsuspended = cardIds.filter((cardId) => !ts.ankiSuspendedCardIds.has(cardId));
-        if (!unsuspended.length) return ts.dt.dictionaryAnkiTreatSuspended;
-        return unsuspended;
-    }
-
-    private async _getTokenStatusFromCutoff(options: {
-        cardIds: number[];
-        ts: TrackState;
-    }): Promise<TokenStatus | null> {
-        const { ts } = options;
-        let cardIds = options.cardIds;
-        const suspendedRes = this._handleSuspendedCards({ cardIds, ts });
-        if (!(suspendedRes instanceof Array)) return suspendedRes;
-        cardIds = suspendedRes;
-
-        if (cardIds.some((c) => ts.ankiCardIdStatuses.get(c) === TokenStatus.MATURE)) return TokenStatus.MATURE;
-        if (cardIds.some((c) => ts.ankiCardIdStatuses.get(c) === TokenStatus.YOUNG)) return TokenStatus.YOUNG;
-        if (cardIds.some((c) => ts.ankiCardIdStatuses.get(c) === TokenStatus.GRADUATED)) return TokenStatus.GRADUATED;
-        if (cardIds.some((c) => ts.ankiCardIdStatuses.get(c) === TokenStatus.LEARNING)) return TokenStatus.LEARNING;
+    private _getTokenStatus(statuses: CardStatus[], ts: TrackState): TokenStatus {
+        if (statuses.length && ts.dt.dictionaryAnkiTreatSuspended !== 'NORMAL') {
+            const unsuspended = statuses.filter((status) => !status.suspended);
+            if (!unsuspended.length) return ts.dt.dictionaryAnkiTreatSuspended;
+            statuses = unsuspended;
+        }
+        if (statuses.some((c) => c.status === TokenStatus.MATURE)) return TokenStatus.MATURE;
+        if (statuses.some((c) => c.status === TokenStatus.YOUNG)) return TokenStatus.YOUNG;
+        if (statuses.some((c) => c.status === TokenStatus.GRADUATED)) return TokenStatus.GRADUATED;
+        if (statuses.some((c) => c.status === TokenStatus.LEARNING)) return TokenStatus.LEARNING;
         return TokenStatus.UNKNOWN;
     }
 
-    private _applyTokenStyle(options: {
-        rawTokenParts: TokenPart[];
-        tokenStatus: TokenStatus | null;
-        dt: DictionaryTrack;
-    }): string {
-        const { rawTokenParts, tokenStatus, dt } = options;
-        const token = this._applyReadingAnnotation({ rawTokenParts, tokenStatus, dt });
-        if (tokenStatus === null) return `<span style="text-decoration: line-through red 3px;">${token}</span>`;
-        if (!dt.colorizeFullyKnownTokens && tokenStatus === getFullyKnownTokenStatus()) return token;
-        const c = dt.tokenStatusColors[tokenStatus];
-        const t = dt.tokenStylingThickness;
-        switch (dt.tokenStyling) {
-            case TokenStyling.TEXT:
-                return `<span style="-webkit-text-fill-color: ${c};">${token}</span>`;
-            case TokenStyling.BACKGROUND:
-                return `<span style="background-color: ${c};">${token}</span>`;
-            case TokenStyling.UNDERLINE:
-            case TokenStyling.OVERLINE:
-                return `<span style="text-decoration: ${dt.tokenStyling} ${c} ${t}px;">${token}</span>`;
-            case TokenStyling.OUTLINE:
-                return `<span style="-webkit-text-stroke: ${t}px ${c};">${token}</span>`;
-            default:
-                return `<span style="text-decoration: line-through red 3px double;">${token}</span>`;
+    /**
+     * If a subtitle has an existing tokenization, the existing tokens are respected.
+     * This function only tokenizes the pieces of text in between the existing tokens, and returns a tokenization
+     * containing both the existing and newly-computed tokens.
+     */
+    private async _tokenizationModelMergedWithExistingOne(
+        fullText: string,
+        existingTokenization: Tokenization,
+        index: number,
+        ts: TrackState
+    ): Promise<{ reconstructedText: string; tokenization: Tokenization } | undefined> {
+        if (!ts.yt) {
+            this.tokenRequestFailedForTracks.add(ts.track);
+            console.error(`Yomitan not initialized`);
+            existingTokenization.error = true;
+            return { reconstructedText: fullText, tokenization: existingTokenization };
+        }
+        if (!existingTokenization.tokens?.length) {
+            return this._tokenizationModel(fullText, index, ts);
+        }
+
+        // We only respect tokens that were not generated by this class i.e. not marked __internal: true
+        const externalTokens = existingTokenization.tokens.filter((t) => !(t as InternalToken).__internal);
+
+        // To ensure that the final token list is in-order, all tokens (existing or not) are chained onto this promise
+        let promise: Promise<void> = Promise.resolve();
+        const reconstructedTextParts: string[] = [];
+        const allTokens: Token[] = [];
+        let error = false;
+
+        iterateOverStringInBlocks(
+            fullText,
+            (_, blockIndex) => externalTokens[blockIndex],
+            (left, right, existingToken?: Token) => {
+                if (existingToken === undefined) {
+                    promise = promise.then(async () => {
+                        const model = await this._tokenizationModel(fullText.substring(left, right), index, ts, left);
+                        if (this.shouldCancelBuild) return;
+                        if (!model) {
+                            error = true; // Should only be undefined if this.shouldCancelBuild
+                            this.erroredCache.add(index);
+                            return;
+                        }
+                        reconstructedTextParts.push(model.reconstructedText);
+                        if (model.tokenization.tokens.length) {
+                            for (const t of model.tokenization.tokens) allTokens.push(t);
+                        } else if (model.tokenization.error) {
+                            error = true;
+                            this.erroredCache.add(index);
+                        }
+                    });
+                } else {
+                    promise = promise.then(async () => {
+                        const tokenText = fullText.substring(existingToken.pos[0], existingToken.pos[1]);
+                        const trimmedToken = tokenText.trim();
+
+                        const tokenToIndexes = this.tokenToIndexesCache.get(trimmedToken);
+                        if (tokenToIndexes) tokenToIndexes.add(index);
+                        else this.tokenToIndexesCache.set(trimmedToken, new Set([index]));
+                        const lemmas = await ts.yt!.lemmatize(trimmedToken);
+                        if (this.shouldCancelBuild) return;
+                        for (const lemma of lemmas) {
+                            const lemmaToIndexes = this.tokenToIndexesCache.get(lemma);
+                            if (lemmaToIndexes) lemmaToIndexes.add(index);
+                            else this.tokenToIndexesCache.set(lemma, new Set([index]));
+                        }
+
+                        const states = ts.tokenStates.get(trimmedToken) ?? [];
+                        const token: Token = {
+                            pos: [existingToken.pos[0], existingToken.pos[1]],
+                            readings: existingToken.readings.map((r) => ({
+                                pos: [r.pos[0], r.pos[1]],
+                                reading: r.reading,
+                            })),
+                            states,
+                            status:
+                                states.includes(TokenState.IGNORED) || !HAS_LETTER_REGEX.test(trimmedToken)
+                                    ? getFullyKnownTokenStatus()
+                                    : await this._tokenStatus(trimmedToken, ts),
+                        };
+                        if (token.status === null) this.erroredCache.add(index);
+                        await this._updateFrequency(token, trimmedToken, index, ts);
+                        if (this.shouldCancelBuild) return;
+
+                        reconstructedTextParts.push(tokenText);
+                        allTokens.push(token);
+                    });
+                }
+            }
+        );
+        try {
+            await promise;
+        } catch (e) {
+            this.tokenRequestFailedForTracks.add(ts.track);
+            console.error(`Tokenization request failed for index ${index}:`, e);
+            this.erroredCache.add(index);
+            existingTokenization.error = true;
+            return { reconstructedText: fullText, tokenization: existingTokenization };
+        }
+        if (this.shouldCancelBuild) return;
+        return { reconstructedText: reconstructedTextParts.join(''), tokenization: { tokens: allTokens, error } };
+    }
+
+    private async _tokenizationModel(
+        fullText: string,
+        index: number,
+        ts: TrackState,
+        baseIndex = 0
+    ): Promise<{ reconstructedText: string; tokenization: Tokenization } | undefined> {
+        try {
+            if (!ts.yt) throw new Error(`Yomitan not initialized for Track${ts.track + 1}`);
+            const tokenizeRes = await ts.yt.tokenize(fullText);
+            if (this.shouldCancelBuild) return;
+            const tokens: Token[] = [];
+            let currentOffset = 0;
+            let reconstructedTextParts = [];
+            for (const tokenParts of tokenizeRes) {
+                const tokenText = tokenParts.map((p) => p.text).join('');
+                reconstructedTextParts.push(tokenText);
+                const trimmedToken = tokenText.trim();
+
+                // Build token
+                const token: InternalToken = {
+                    pos: [baseIndex + currentOffset, baseIndex + currentOffset + tokenText.length],
+                    states: ts.tokenStates.get(trimmedToken) ?? [],
+                    __internal: true, // This token was generated by this class
+                    readings: [],
+                };
+                tokens.push(token);
+                currentOffset += tokenText.length;
+
+                // Build readings
+                const externalReadings = this.externalTokenReadings.get(tokenText);
+                if (externalReadings) {
+                    token.readings = externalReadings.get(ts.track) ?? externalReadings.values().next().value!;
+                } else {
+                    let currentPartOffset = 0;
+                    for (const part of tokenParts) {
+                        if (part.reading) {
+                            token.readings.push({
+                                pos: [currentPartOffset, currentPartOffset + part.text.length],
+                                reading: part.reading,
+                            });
+                        }
+                        currentPartOffset += part.text.length;
+                    }
+                }
+
+                const tokenToIndexes = this.tokenToIndexesCache.get(trimmedToken);
+                if (tokenToIndexes) tokenToIndexes.add(index);
+                else this.tokenToIndexesCache.set(trimmedToken, new Set([index]));
+                const lemmas = await ts.yt.lemmatize(trimmedToken);
+                if (this.shouldCancelBuild) return;
+                for (const lemma of lemmas) {
+                    const lemmaToIndexes = this.tokenToIndexesCache.get(lemma);
+                    if (lemmaToIndexes) lemmaToIndexes.add(index);
+                    else this.tokenToIndexesCache.set(lemma, new Set([index]));
+                }
+
+                // Build token status
+                if (token.states.includes(TokenState.IGNORED) || !HAS_LETTER_REGEX.test(trimmedToken)) {
+                    token.status = getFullyKnownTokenStatus();
+                    continue;
+                }
+                token.status = await this._tokenStatus(trimmedToken, ts);
+                if (token.status === null) this.erroredCache.add(index);
+                await this._updateFrequency(token, trimmedToken, index, ts);
+                if (this.shouldCancelBuild) return;
+            }
+
+            return { reconstructedText: reconstructedTextParts.join(''), tokenization: { tokens } };
+        } catch (error) {
+            this.tokenRequestFailedForTracks.add(ts.track);
+            console.error(`Error colorizing subtitle text for Track${ts.track + 1}:`, error);
+            this.erroredCache.add(index);
+            return { reconstructedText: fullText, tokenization: { tokens: [], error: true } };
         }
     }
 
-    private _applyReadingAnnotation(options: {
-        rawTokenParts: TokenPart[];
-        tokenStatus: TokenStatus | null;
-        dt: DictionaryTrack;
-    }): string {
-        const { rawTokenParts, tokenStatus, dt } = options;
-        if (rawTokenParts.every((p) => !HAS_LETTER_REGEX.test(p.text))) {
-            return rawTokenParts.map((p) => p.text).join(''); // Prevent 。 -> まる
+    private async _updateFrequency(token: Token, trimmedToken: string, index: number, ts: TrackState): Promise<void> {
+        if (!ts.yt) throw new Error('Yomitan uninitialized - cannot update token frequency');
+        if (ts.dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.NEVER) return;
+        if (
+            ts.dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.UNCOLLECTED_ONLY &&
+            token.status !== TokenStatus.UNCOLLECTED
+        ) {
+            return;
         }
-        const ano = dt.dictionaryTokenReadingAnnotation;
-        if (ano === TokenReadingAnnotation.NEVER) return rawTokenParts.map((p) => p.text).join('');
-        if (tokenStatus !== null) {
-            if (
-                (ano === TokenReadingAnnotation.LEARNING_OR_BELOW && tokenStatus > TokenStatus.LEARNING) ||
-                (ano === TokenReadingAnnotation.UNKNOWN_OR_BELOW && tokenStatus > TokenStatus.UNKNOWN)
-            ) {
-                return rawTokenParts.map((p) => p.text).join('');
+        if (ts.yt.getSupportsTokenizeFrequency() || this.initialized) {
+            token.frequency = await ts.yt.frequency(trimmedToken);
+        } else {
+            this.refreshCache.add(index);
+        }
+    }
+
+    private async _tokenStatus(trimmedToken: string, ts: TrackState): Promise<TokenStatus | null> {
+        if (!ts.yt) throw new Error('Yomitan uninitialized - cannot calculate token status');
+        switch (ts.dt.dictionaryTokenMatchStrategyPriority) {
+            case TokenMatchStrategyPriority.EXACT:
+                return await this._handlePriorityExact(trimmedToken, ts);
+            case TokenMatchStrategyPriority.LEMMA:
+                return await this._handlePriorityLemma(trimmedToken, ts);
+            case TokenMatchStrategyPriority.BEST_KNOWN:
+                return await this._handlePriorityKnown(trimmedToken, ts, (tokenStatuses) => Math.max(...tokenStatuses));
+            case TokenMatchStrategyPriority.LEAST_KNOWN:
+                return await this._handlePriorityKnown(trimmedToken, ts, (tokenStatuses) => Math.min(...tokenStatuses));
+            default:
+                throw new Error(`Unknown strategy priority: ${ts.dt.dictionaryTokenMatchStrategyPriority}`);
+        }
+    }
+
+    private async _handlePriorityExact(trimmedToken: string, ts: TrackState): Promise<TokenStatus | null> {
+        if (shouldUseExactForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult && tokenStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                return tokenStatusResult.status;
             }
         }
-        return rawTokenParts
-            .map((p) => (p.reading.length ? `<ruby>${p.text}<rt>${p.reading}</rt></ruby>` : p.text))
-            .join('');
+        if (shouldUseLemmaForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const lemmaStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult && lemmaStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                    lemmaStatusResults.push(lemmaStatusResult);
+                }
+            }
+            if (lemmaStatusResults.length) return Math.max(...lemmaStatusResults.map((r) => r.status));
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const anyFormStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const statusResults = ts.collectedAnyForm.get(lemma);
+                if (!statusResults) continue;
+                for (const statusResult of statusResults) {
+                    if (statusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                        anyFormStatusResults.push(statusResult);
+                    }
+                }
+            }
+            if (anyFormStatusResults.length) {
+                const exactMatches = anyFormStatusResults.filter((r) => r.token === trimmedToken);
+                if (exactMatches.length) return Math.max(...exactMatches.map((r) => r.status));
+                const lemmaMatches = anyFormStatusResults.filter((r) => lemmas.includes(r.token!));
+                if (lemmaMatches.length) return Math.max(...lemmaMatches.map((r) => r.status));
+                return Math.max(...anyFormStatusResults.map((r) => r.status));
+            }
+        }
+        if (shouldUseExactForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) return tokenStatusResult.status;
+        }
+        if (shouldUseLemmaForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const lemmaStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                    lemmaStatusResults.push(lemmaStatusResult);
+                }
+            }
+            if (lemmaStatusResults.length) return Math.max(...lemmaStatusResults.map((r) => r.status));
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const anyFormStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const anyFormStatusResult = ts.collectedAnyForm.get(lemma);
+                if (!anyFormStatusResult) continue;
+                for (const statusResult of anyFormStatusResult) {
+                    if (statusResult.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                        anyFormStatusResults.push(statusResult);
+                    }
+                }
+            }
+            if (anyFormStatusResults.length) {
+                const exactMatches = anyFormStatusResults.filter((r) => r.token === trimmedToken);
+                if (exactMatches.length) return Math.max(...exactMatches.map((r) => r.status));
+                const lemmaMatches = anyFormStatusResults.filter((r) => lemmas.includes(r.token!));
+                if (lemmaMatches.length) return Math.max(...lemmaMatches.map((r) => r.status));
+                return Math.max(...anyFormStatusResults.map((r) => r.status));
+            }
+        }
+        return TokenStatus.UNCOLLECTED;
+    }
+
+    private async _handlePriorityLemma(trimmedToken: string, ts: TrackState): Promise<TokenStatus | null> {
+        if (shouldUseLemmaForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const lemmaStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult && lemmaStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                    lemmaStatusResults.push(lemmaStatusResult);
+                }
+            }
+            if (lemmaStatusResults.length) return Math.max(...lemmaStatusResults.map((r) => r.status));
+        }
+        if (shouldUseExactForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult && tokenStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                return tokenStatusResult.status;
+            }
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const anyFormStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const statusResults = ts.collectedAnyForm.get(lemma);
+                if (!statusResults) continue;
+                for (const statusResult of statusResults) {
+                    if (statusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                        anyFormStatusResults.push(statusResult);
+                    }
+                }
+            }
+            if (anyFormStatusResults.length) {
+                const lemmaMatches = anyFormStatusResults.filter((r) => lemmas.includes(r.token!));
+                if (lemmaMatches.length) return Math.max(...lemmaMatches.map((r) => r.status));
+                const exactMatches = anyFormStatusResults.filter((r) => r.token === trimmedToken);
+                if (exactMatches.length) return Math.max(...exactMatches.map((r) => r.status));
+                return Math.max(...anyFormStatusResults.map((r) => r.status));
+            }
+        }
+        if (shouldUseLemmaForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const lemmaStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                    lemmaStatusResults.push(lemmaStatusResult);
+                }
+            }
+            if (lemmaStatusResults.length) return Math.max(...lemmaStatusResults.map((r) => r.status));
+        }
+        if (shouldUseExactForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) return tokenStatusResult.status;
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            const anyFormStatusResults: TokenStatusResult[] = [];
+            for (const lemma of lemmas) {
+                const anyFormStatusResult = ts.collectedAnyForm.get(lemma);
+                if (!anyFormStatusResult) continue;
+                for (const statusResult of anyFormStatusResult) {
+                    if (statusResult.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                        anyFormStatusResults.push(statusResult);
+                    }
+                }
+            }
+            if (anyFormStatusResults.length) {
+                const lemmaMatches = anyFormStatusResults.filter((r) => lemmas.includes(r.token!));
+                if (lemmaMatches.length) return Math.max(...lemmaMatches.map((r) => r.status));
+                const exactMatches = anyFormStatusResults.filter((r) => r.token === trimmedToken);
+                if (exactMatches.length) return Math.max(...exactMatches.map((r) => r.status));
+                return Math.max(...anyFormStatusResults.map((r) => r.status));
+            }
+        }
+        return TokenStatus.UNCOLLECTED;
+    }
+
+    private async _handlePriorityKnown(
+        trimmedToken: string,
+        ts: TrackState,
+        cmp: (tokenStatuses: TokenStatus[]) => TokenStatus
+    ): Promise<TokenStatus | null> {
+        const tokenStatuses: TokenStatus[] = [];
+
+        if (shouldUseExactForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult && tokenStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                tokenStatuses.push(tokenStatusResult.status);
+            }
+        }
+        if (shouldUseLemmaForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult && lemmaStatusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                    tokenStatuses.push(lemmaStatusResult.status);
+                }
+            }
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            for (const lemma of lemmas) {
+                const statusResults = ts.collectedAnyForm.get(lemma);
+                if (!statusResults) continue;
+                for (const statusResult of statusResults) {
+                    if (statusResult.source !== DictionaryTokenSource.ANKI_SENTENCE) {
+                        tokenStatuses.push(statusResult.status);
+                    }
+                }
+            }
+        }
+        if (tokenStatuses.length) return cmp(tokenStatuses);
+
+        if (shouldUseExactForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const tokenStatusResult = ts.collectedExactForm.get(trimmedToken);
+            if (tokenStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                tokenStatuses.push(tokenStatusResult.status);
+            }
+        }
+        if (shouldUseLemmaForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            for (const lemma of lemmas) {
+                const lemmaStatusResult = ts.collectedLemmaForm.get(lemma);
+                if (lemmaStatusResult?.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                    tokenStatuses.push(lemmaStatusResult.status);
+                }
+            }
+        }
+        if (shouldUseAnyForm(ts.dt.dictionaryAnkiSentenceTokenMatchStrategy)) {
+            const lemmas = await ts.yt!.lemmatize(trimmedToken);
+            if (this.shouldCancelBuild) return null;
+            for (const lemma of lemmas) {
+                const anyFormStatusResult = ts.collectedAnyForm.get(lemma);
+                if (!anyFormStatusResult) continue;
+                for (const statusResult of anyFormStatusResult) {
+                    if (statusResult.source === DictionaryTokenSource.ANKI_SENTENCE) {
+                        tokenStatuses.push(statusResult.status);
+                    }
+                }
+            }
+        }
+        if (tokenStatuses.length) return cmp(tokenStatuses);
+
+        return TokenStatus.UNCOLLECTED;
     }
 
     unbind() {
+        this.reset();
+        if (this.removeBuildAnkiCacheStateChangeCB) {
+            this.removeBuildAnkiCacheStateChangeCB();
+            this.removeBuildAnkiCacheStateChangeCB = undefined;
+        }
+        if (this.removeAnkiCardModifiedCB) {
+            this.removeAnkiCardModifiedCB();
+            this.removeAnkiCardModifiedCB = undefined;
+        }
         if (this.subtitlesInterval) {
             clearInterval(this.subtitlesInterval);
             this.subtitlesInterval = undefined;
         }
-        this.resetCache();
     }
 }
+
+export class HoveredToken {
+    private _hoveredElement: HTMLElement | null;
+
+    constructor() {
+        this._hoveredElement = null;
+    }
+
+    handleMouseOver(mouseEvent: MouseEvent): void {
+        if (!(mouseEvent.target instanceof HTMLElement)) return;
+        this._hoveredElement = mouseEvent.target;
+    }
+
+    handleMouseOut(mouseEvent: MouseEvent): void {
+        if (!(mouseEvent.target instanceof HTMLElement) || this._hoveredElement === mouseEvent.target) {
+            this._hoveredElement = null;
+        }
+    }
+
+    parse(): { token: string; track: number } | null {
+        const tokenEl = this._hoveredElement?.closest(`.${ASB_TOKEN_CLASS}`);
+        if (!tokenEl) return null;
+
+        const trackStr = tokenEl.closest('[data-track]')?.getAttribute('data-track');
+        if (!trackStr) return null;
+
+        let token = '';
+        for (const child of tokenEl.childNodes) token += this._extractTokenFromNode(child);
+        token = token.trim();
+        if (!token.length) return null;
+        return { token, track: parseInt(trackStr) };
+    }
+
+    private _extractTokenFromNode(node: Node): string {
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? '';
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+        let token = '';
+        const el = node as HTMLElement;
+        if (el.tagName === 'RUBY') {
+            for (const child of el.childNodes) {
+                if (child.nodeType === Node.ELEMENT_NODE && (child as HTMLElement).tagName === 'RT') continue;
+                token += this._extractTokenFromNode(child);
+            }
+            return token;
+        }
+
+        for (const child of el.childNodes) token += this._extractTokenFromNode(child);
+        return token;
+    }
+}
+
+export const renderRichTextOntoSubtitles = (subtitles: RichSubtitleModel[], dictionaryTracks?: DictionaryTrack[]) => {
+    for (const s of subtitles) {
+        if (s.tokenization && !s.richText) {
+            s.richText = computeRichText(s.text, s.tokenization, dictionaryTracks?.[s.track]);
+        }
+    }
+};
+
+const computeRichText = (fullText: string, tokenization: Tokenization, dt?: DictionaryTrack) => {
+    if (tokenization.error) {
+        return `<span ${ERROR_STYLE}>${fullText}</span>`;
+    }
+
+    if (!tokenization.tokens?.length) {
+        return undefined;
+    }
+
+    const parts: string[] = [];
+    iterateOverStringInBlocks(
+        fullText,
+        (_, blockIndex) => tokenization.tokens[blockIndex],
+        (left, right, token?: Token) => {
+            if (token === undefined) {
+                parts.push(fullText.substring(left, right));
+            } else {
+                parts.push(applyTokenStyle(fullText, token, false, dt));
+            }
+        }
+    );
+    return parts.join('');
+};
+
+const ERROR_STYLE = `style="text-decoration: line-through red 3px;"`;
+const LOGIC_ERROR_STYLE = `style="text-decoration: line-through red 3px double;"`;
+
+export const applyTokenStyle = (fullText: string, token: Token, allowAsciiReading: boolean, dt?: DictionaryTrack) => {
+    const tokenText = applyFrequencyAnnotation(
+        applyReadingAnnotation(fullText, token, allowAsciiReading, dt),
+        token,
+        dt
+    );
+    if (token.status === null) return `<span ${ERROR_STYLE}>${tokenText}</span>`;
+    if (token.status === undefined && dt && dictionaryTrackEnabled(dt)) {
+        return `<span ${LOGIC_ERROR_STYLE}>${tokenText}</span>`; // External tokens may flash this on initial load
+    }
+    if (!dt?.dictionaryColorizeSubtitles) return tokenText;
+
+    const s = HAS_LETTER_REGEX.test(tokenText)
+        ? `<span class="${ASB_TOKEN_CLASS}${dt.dictionaryHighlightOnHover ? ` ${ASB_TOKEN_HIGHLIGHT_CLASS}` : ''}"`
+        : '<span';
+    const config = dt.dictionaryTokenStatusConfig[token.status!];
+    if (!config.display) return `${s}>${tokenText}</span>`;
+
+    const c = `${config.color}${config.alpha}`;
+    const t = dt.dictionaryTokenStylingThickness;
+    switch (dt.dictionaryTokenStyling) {
+        case TokenStyling.TEXT:
+            return `${s} style="-webkit-text-fill-color: ${c};">${tokenText}</span>`;
+        case TokenStyling.BACKGROUND:
+            return `${s} style="background-color: ${c};">${tokenText}</span>`;
+        case TokenStyling.UNDERLINE:
+        case TokenStyling.OVERLINE:
+            return `${s} style="text-decoration: ${dt.dictionaryTokenStyling} ${c} ${t}px;">${tokenText}</span>`;
+        case TokenStyling.OUTLINE:
+            return `${s} style="-webkit-text-stroke: ${t}px ${c};">${tokenText}</span>`;
+        default:
+            return `${s} ${LOGIC_ERROR_STYLE}>${tokenText}</span>`;
+    }
+};
+
+const applyReadingAnnotation = (fullText: string, token: Token, allowAsciiReading: boolean, dt?: DictionaryTrack) => {
+    const tokenText = fullText.substring(token.pos[0], token.pos[1]);
+    if (!token.readings.length || !HAS_LETTER_REGEX.test(tokenText)) {
+        return tokenText; // Prevent 。 -> まる
+    }
+    if (ONLY_ASCII_LETTERS_REGEX.test(tokenText) && !allowAsciiReading) {
+        return tokenText; // Prevent english words from getting readings
+    }
+
+    // Only apply skip logic for tokens generated by this class i.e. marked __internal: true
+    if (dt && (token as InternalToken).__internal) {
+        const ignoredToken = token.states.includes(TokenState.IGNORED);
+        const ano = ignoredToken
+            ? dt.dictionaryDisplayIgnoredTokenReadings
+                ? TokenReadingAnnotation.ALWAYS
+                : TokenReadingAnnotation.NEVER
+            : dt.dictionaryTokenReadingAnnotation;
+        if (ano === TokenReadingAnnotation.NEVER) return tokenText;
+        if (token.status !== undefined && token.status !== null) {
+            if (
+                (ano === TokenReadingAnnotation.LEARNING_OR_BELOW && token.status > TokenStatus.LEARNING) ||
+                (ano === TokenReadingAnnotation.UNKNOWN_OR_BELOW && token.status > TokenStatus.UNKNOWN)
+            ) {
+                return tokenText;
+            }
+        }
+    }
+
+    const parts: string[] = [];
+    iterateOverStringInBlocks(
+        tokenText,
+        (_, blockIndex) => token.readings[blockIndex],
+        (left, right, reading?: TokenReading) => {
+            if (reading === undefined) {
+                parts.push(tokenText.substring(left, right));
+            } else {
+                const part = tokenText.substring(reading.pos[0], reading.pos[1]);
+                parts.push(`<ruby class="${ASB_READING_CLASS}">${part}<rt>${reading.reading}</rt></ruby>`);
+            }
+        }
+    );
+    return parts.join('');
+};
+
+const applyFrequencyAnnotation = (tokenText: string, token: Token, dt?: DictionaryTrack) => {
+    if (token.frequency === undefined || !HAS_LETTER_REGEX.test(tokenText) || !dt) return tokenText;
+    if (dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.NEVER) return tokenText;
+    if (
+        dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.UNCOLLECTED_ONLY &&
+        token.status !== TokenStatus.UNCOLLECTED
+    ) {
+        return tokenText;
+    }
+    return `<ruby class="${ASB_FREQUENCY_CLASS}">${tokenText}<rt>${token.frequency}</rt></ruby>`;
+};

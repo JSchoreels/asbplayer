@@ -12,6 +12,7 @@ import {
     RichSubtitleModel,
 } from '@project/common';
 import {
+    DictionaryTrack,
     SettingsProvider,
     SubtitleAlignment,
     SubtitleSettings,
@@ -19,7 +20,7 @@ import {
     allTextSubtitleSettings,
 } from '@project/common/settings';
 import { SubtitleSlice } from '@project/common/subtitle-collection';
-import { SubtitleColoring } from '@project/common/subtitle-coloring';
+import { renderRichTextOntoSubtitles, SubtitleColoring } from '@project/common/subtitle-coloring';
 import { arrayEquals, computeStyleString, surroundingSubtitles } from '@project/common/util';
 import i18n from 'i18next';
 import {
@@ -30,6 +31,7 @@ import {
     OffsetAnchor,
 } from '../services/element-overlay';
 import { v4 as uuidv4 } from 'uuid';
+import { DictionaryProvider } from '@project/common/dictionary-db';
 
 const BOUNDING_BOX_PADDING = 25;
 
@@ -67,6 +69,7 @@ class VideoFetcher implements Fetcher {
 
 export default class SubtitleController {
     private readonly video: HTMLMediaElement;
+    private readonly dictionary: DictionaryProvider;
     private readonly settings: SettingsProvider;
 
     private showingSubtitles?: IndexedSubtitleModel[];
@@ -98,6 +101,7 @@ export default class SubtitleController {
     subtitleHtml: SubtitleHtml;
     refreshCurrentSubtitle: boolean;
     _preCacheDom;
+    dictionaryTrackSettings?: DictionaryTrack[];
 
     readonly autoPauseContext: AutoPauseContext = new AutoPauseContext();
 
@@ -105,9 +109,11 @@ export default class SubtitleController {
     onSlice?: (subtitle: SubtitleSlice<IndexedSubtitleModel>) => void;
     onOffsetChange?: () => void;
     onMouseOver?: (event: MouseEvent) => void;
+    onMouseOut?: (event: MouseEvent) => void;
 
-    constructor(video: HTMLMediaElement, settings: SettingsProvider) {
+    constructor(video: HTMLMediaElement, dictionary: DictionaryProvider, settings: SettingsProvider) {
         this.video = video;
+        this.dictionary = dictionary;
         this.settings = settings;
         this._preCacheDom = false;
         this.showingSubtitles = [];
@@ -133,7 +139,8 @@ export default class SubtitleController {
         this.topSubtitlesElementOverlay = topSubtitlesElementOverlay;
         this.notificationElementOverlay = notificationElementOverlay;
         this.subtitleColoring = new SubtitleColoring(
-            this.settings.getAll(),
+            this.dictionary,
+            this.settings,
             { showingCheckRadiusMs: 150 },
             (updatedSubtitles) => this._subtitleColorsUpdated(updatedSubtitles),
             () => this.video.currentTime * 1000,
@@ -288,6 +295,7 @@ export default class SubtitleController {
             offsetAnchor: OffsetAnchor.bottom,
             contentWidthPercentage: -1,
             onMouseOver: (event: MouseEvent) => this.onMouseOver?.(event),
+            onMouseOut: (event: MouseEvent) => this.onMouseOut?.(event),
         };
         const topSubtitleOverlayParams: ElementOverlayParams = {
             targetElement: this.video,
@@ -298,6 +306,7 @@ export default class SubtitleController {
             offsetAnchor: OffsetAnchor.top,
             contentWidthPercentage: -1,
             onMouseOver: (event: MouseEvent) => this.onMouseOver?.(event),
+            onMouseOut: (event: MouseEvent) => this.onMouseOut?.(event),
         };
         const notificationOverlayParams: ElementOverlayParams =
             this._getSubtitleTrackAlignment(0) === 'bottom'
@@ -310,6 +319,7 @@ export default class SubtitleController {
                       offsetAnchor: OffsetAnchor.top,
                       contentWidthPercentage: -1,
                       onMouseOver: (event: MouseEvent) => this.onMouseOver?.(event),
+                      onMouseOut: (event: MouseEvent) => this.onMouseOut?.(event),
                   }
                 : {
                       targetElement: this.video,
@@ -320,23 +330,30 @@ export default class SubtitleController {
                       offsetAnchor: OffsetAnchor.bottom,
                       contentWidthPercentage: -1,
                       onMouseOver: (event: MouseEvent) => this.onMouseOver?.(event),
+                      onMouseOut: (event: MouseEvent) => this.onMouseOut?.(event),
                   };
 
         return { subtitleOverlayParams, topSubtitleOverlayParams, notificationOverlayParams };
     }
 
     private _subtitleColorsUpdated(updatedSubtitles: RichSubtitleModel[]): void {
-        for (const updatedSubtitle of updatedSubtitles) {
+        if (this.dictionaryTrackSettings) {
+            renderRichTextOntoSubtitles(updatedSubtitles, this.dictionaryTrackSettings);
+        }
+
+        const htmls = this._buildSubtitlesHtml(updatedSubtitles);
+        for (const [index, updatedSubtitle] of updatedSubtitles.entries()) {
+            const html = htmls[index];
             if (this._getSubtitleTrackAlignment(updatedSubtitle.track) === 'bottom') {
                 if (
                     this.shouldRenderBottomOverlay &&
                     this.bottomSubtitlesElementOverlay instanceof CachingElementOverlay
                 ) {
-                    this.bottomSubtitlesElementOverlay.uncacheHtmlKey(String(updatedSubtitle.index));
+                    this.bottomSubtitlesElementOverlay.cacheHtml(html.key, html.html());
                 }
             } else {
                 if (this.shouldRenderTopOverlay && this.topSubtitlesElementOverlay instanceof CachingElementOverlay) {
-                    this.topSubtitlesElementOverlay.uncacheHtmlKey(String(updatedSubtitle.index));
+                    this.topSubtitlesElementOverlay.cacheHtml(html.key, html.html());
                 }
             }
             if (this.showingSubtitles?.some((s) => s.index === updatedSubtitle.index)) {
@@ -548,6 +565,7 @@ export default class SubtitleController {
         this.onSlice = undefined;
         this.onOffsetChange = undefined;
         this.onMouseOver = undefined;
+        this.onMouseOut = undefined;
     }
 
     refresh() {

@@ -13,11 +13,11 @@ import { useI18n } from '../hooks/use-i18n';
 import Paper from '@mui/material/Paper';
 import { Anki } from '@project/common/anki';
 import { useSupportedLanguages } from '../hooks/use-supported-languages';
-import { isFirefoxBuild } from '../../services/build-flags';
 import SettingsProfileSelectMenu from '@project/common/components/SettingsProfileSelectMenu';
 import { AsbplayerSettings, Profile, testCard } from '@project/common/settings';
 import { useTheme, type Theme } from '@mui/material/styles';
 import { settingsPageConfigs } from '@/services/pages';
+import { DictionaryProvider } from '@project/common/dictionary-db';
 
 const useStyles = makeStyles<Theme>((theme) => ({
     root: {
@@ -35,11 +35,14 @@ const useStyles = makeStyles<Theme>((theme) => ({
 }));
 
 interface Props {
+    dictionaryProvider: DictionaryProvider;
     settings: AsbplayerSettings;
     onSettingsChanged: (settings: Partial<AsbplayerSettings>) => void;
     profiles: Profile[];
     activeProfile?: string;
     inTutorial?: boolean;
+    inAnnotationTutorial?: boolean;
+    onAnnotationTutorialSeen?: () => void;
     onNewProfile: (name: string) => void;
     onRemoveProfile: (name: string) => void;
     onSetActiveProfile: (name: string | undefined) => void;
@@ -52,7 +55,15 @@ const extensionTestCard: () => Promise<CardModel> = () => {
     });
 };
 
-const SettingsPage = ({ settings, inTutorial, onSettingsChanged, ...profileContext }: Props) => {
+const SettingsPage = ({
+    dictionaryProvider,
+    settings,
+    inTutorial,
+    inAnnotationTutorial,
+    onAnnotationTutorialSeen,
+    onSettingsChanged,
+    ...profileContext
+}: Props) => {
     const { t } = useTranslation();
     const theme = useTheme();
     const anki = useMemo(
@@ -104,17 +115,22 @@ const SettingsPage = ({ settings, inTutorial, onSettingsChanged, ...profileConte
                         extensionVersion={browser.runtime.getManifest().version}
                         extensionSupportsAppIntegration
                         extensionSupportsOverlay
-                        extensionSupportsSidePanel={!isFirefoxBuild}
+                        extensionSupportsSidePanel
                         extensionSupportsOrderableAnkiFields
                         extensionSupportsTrackSpecificSettings
                         extensionSupportsSubtitlesWidthSetting
                         extensionSupportsPauseOnHover
                         extensionSupportsExportCardBind
                         extensionSupportsPageSettings
+                        extensionSupportsDictionary
+                        extensionSupportsDictionaryTokenStatusDisplayAlpha
                         chromeKeyBinds={commands}
                         onOpenChromeExtensionShortcuts={handleOpenExtensionShortcuts}
                         onSettingsChanged={onSettingsChanged}
+                        dictionaryProvider={dictionaryProvider}
                         settings={settings}
+                        profiles={profileContext.profiles}
+                        activeProfile={profileContext.activeProfile}
                         pageConfigs={settingsPageConfigs}
                         localFontsAvailable={localFontsAvailable}
                         localFontsPermission={localFontsPermission}
@@ -123,6 +139,8 @@ const SettingsPage = ({ settings, inTutorial, onSettingsChanged, ...profileConte
                         onUnlockLocalFonts={handleUnlockLocalFonts}
                         scrollToId={section}
                         inTutorial={inTutorial}
+                        inAnnotationTutorial={inAnnotationTutorial}
+                        onAnnotationTutorialSeen={onAnnotationTutorialSeen}
                         testCard={extensionTestCard}
                     />
                 </DialogContent>

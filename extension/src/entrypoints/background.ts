@@ -44,6 +44,8 @@ import ToggleSidePanelHandler from '@/handlers/video/toggle-side-panel-handler';
 import CopySubtitleHandler from '@/handlers/asbplayerv2/copy-subtitle-handler';
 import { RequestingActiveTabPermissionHandler } from '@/handlers/video/requesting-active-tab-permission';
 import { CardPublisher } from '@/services/card-publisher';
+import CardUpdatedDialogHandler from '@/handlers/asbplayerv2/card-updated-dialog-handler';
+import CardExportedDialogHandler from '@/handlers/asbplayerv2/card-exported-dialog-handler';
 import AckMessageHandler from '@/handlers/video/ack-message-handler';
 import PublishCardHandler from '@/handlers/asbplayerv2/publish-card-handler';
 import BulkExportCancellationHandler from '@/handlers/asbplayerv2/bulk-export-cancellation-handler';
@@ -65,6 +67,12 @@ import ClearCopyHistoryHandler from '@/handlers/asbplayerv2/clear-copy-history-h
 import SaveCopyHistoryHandler from '@/handlers/asbplayerv2/save-copy-history-handler';
 import PageConfigHandler from '@/handlers/asbplayerv2/page-config-handler';
 import EncodeMp3Handler from '@/handlers/video/encode-mp3-handler';
+import { DictionaryDB } from '@project/common/dictionary-db/dictionary-db';
+import DictionaryHandler from '@/handlers/dictionary/dictionary-handler';
+import SaveTokenLocalHandler from '@/handlers/asbplayerv2/save-token-local-handler';
+import { ExtensionGlobalStateProvider } from '@/services/extension-global-state-provider';
+import { lt as semverLt } from 'semver';
+import { AnnotationTutorialState } from '@project/common/global-state';
 
 export default defineBackground(() => {
     if (!isFirefoxBuild) {
@@ -77,31 +85,65 @@ export default defineBackground(() => {
         primeLocalization(await settings.getSingle('language'));
     };
 
+    const globalStateProvider = new ExtensionGlobalStateProvider();
+
+    const updateBadgeForAnnotationTutorial = () => {
+        browser.action.setBadgeText({ text: '!' });
+        browser.storage.local.onChanged.addListener((changes) => {
+            // Hide the "!" badge when the user views the annotation tutorial
+            for (const [key, { newValue }] of Object.entries(changes)) {
+                if (key === 'ftueAnnotation' && newValue !== AnnotationTutorialState.shouldSee) {
+                    browser.action.setBadgeText({ text: '' });
+                }
+            }
+        });
+    };
+
+    globalStateProvider.get(['ftueAnnotation']).then((s) => {
+        if (s.ftueAnnotation === AnnotationTutorialState.shouldSee) {
+            updateBadgeForAnnotationTutorial();
+        }
+    });
+
     const installListener = async (details: Browser.runtime.InstalledDetails) => {
-        if (details.reason !== browser.runtime.OnInstalledReason.INSTALL) {
+        if (details.reason === browser.runtime.OnInstalledReason.UPDATE) {
+            primeLocalization(await settings.getSingle('language'));
+
+            // Existing users who upgrade to 1.14.0 should see the annotation tutorial
+            if (details.previousVersion !== undefined && semverLt(details.previousVersion, '1.14.0')) {
+                const annotationTutorialState = (await globalStateProvider.get(['ftueAnnotation'])).ftueAnnotation;
+                if (annotationTutorialState === AnnotationTutorialState.hasNotSeen) {
+                    await globalStateProvider.set({ ftueAnnotation: AnnotationTutorialState.shouldSee });
+                    updateBadgeForAnnotationTutorial();
+                }
+            }
             return;
         }
 
-        const defaultUiLanguage = browser.i18n.getUILanguage();
-        const supportedLanguages = await fetchSupportedLanguages();
+        if (details.reason === browser.runtime.OnInstalledReason.INSTALL) {
+            // Remove subtag e.g. "en-US" is converted to "en"
+            const defaultUiLanguage = browser.i18n.getUILanguage().split('-')[0];
+            const supportedLanguages = await fetchSupportedLanguages();
 
-        if (supportedLanguages.includes(defaultUiLanguage)) {
-            await settings.set({ language: defaultUiLanguage });
-            primeLocalization(defaultUiLanguage);
+            if (supportedLanguages.includes(defaultUiLanguage)) {
+                await settings.set({ language: defaultUiLanguage });
+            }
+
+            await primeLocalization(await settings.getSingle('language'));
+
+            if (isMobile) {
+                // Set reasonable defaults for mobile
+                await settings.set({
+                    streamingTakeScreenshot: false, // Kiwi Browser does not support captureVisibleTab
+                    subtitleSize: 18,
+                    subtitlePositionOffset: 25,
+                    topSubtitlePositionOffset: 25,
+                    subtitlesWidth: 100,
+                });
+            }
+
+            browser.tabs.create({ url: browser.runtime.getURL('/ftue-ui.html'), active: true });
         }
-
-        if (isMobile) {
-            // Set reasonable defaults for mobile
-            await settings.set({
-                streamingTakeScreenshot: false, // Kiwi Browser does not support captureVisibleTab
-                subtitleSize: 18,
-                subtitlePositionOffset: 25,
-                topSubtitlePositionOffset: 25,
-                subtitlesWidth: 100,
-            });
-        }
-
-        browser.tabs.create({ url: browser.runtime.getURL('/ftue-ui.html'), active: true });
     };
 
     const updateListener = async (details: Browser.runtime.InstalledDetails) => {
@@ -123,6 +165,7 @@ export default defineBackground(() => {
     );
     const imageCapturer = new ImageCapturer(settings);
     const cardPublisher = new CardPublisher(settings);
+    const dictionaryDB = new DictionaryDB();
 
     const handlers: CommandHandler[] = [
         new VideoHeartbeatHandler(tabRegistry),
@@ -138,17 +181,21 @@ export default defineBackground(() => {
         new OpenAsbplayerSettingsHandler(),
         new CopyToClipboardHandler(),
         new EncodeMp3Handler(),
+        new DictionaryHandler(dictionaryDB),
         new VideoDisappearedHandler(tabRegistry),
         new RequestingActiveTabPermissionHandler(),
         new CopySubtitleHandler(tabRegistry),
         new LoadSubtitlesHandler(tabRegistry),
         new RequestSubtitlesHandler(),
         new RequestCurrentSubtitleHandler(),
+        new SaveTokenLocalHandler(),
         new RequestCopyHistoryHandler(),
         new SaveCopyHistoryHandler(settings),
         new DeleteCopyHistoryHandler(settings),
         new ClearCopyHistoryHandler(settings),
         new PublishCardHandler(cardPublisher),
+        new CardUpdatedDialogHandler(),
+        new CardExportedDialogHandler(),
         new BulkExportCancellationHandler(cardPublisher),
         new BulkExportStartedHandler(cardPublisher),
         new AckMessageHandler(tabRegistry),

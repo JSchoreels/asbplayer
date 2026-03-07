@@ -17,6 +17,9 @@ import { useRequestingActiveTabPermission } from '../hooks/use-requesting-active
 import { isMobile } from 'react-device-detect';
 import { useSettingsProfileContext } from '@project/common/hooks/use-settings-profile-context';
 import { StyledEngineProvider } from '@mui/material/styles';
+import { DictionaryProvider } from '@project/common/dictionary-db';
+import { ExtensionDictionaryStorage } from '@/services/extension-dictionary-storage';
+import { isFirefoxBuild } from '@/services/build-flags';
 
 interface Props {
     commands: any;
@@ -33,6 +36,7 @@ const notifySettingsUpdated = () => {
 };
 
 export function PopupUi({ commands }: Props) {
+    const dictionaryProvider = useMemo(() => new DictionaryProvider(new ExtensionDictionaryStorage()), []);
     const settingsProvider = useMemo(() => new SettingsProvider(new ExtensionSettingsStorage()), []);
     const [settings, setSettings] = useState<AsbplayerSettings>();
     const theme = useMemo(() => settings && createTheme(settings.themeType), [settings]);
@@ -61,8 +65,13 @@ export function PopupUi({ commands }: Props) {
     }, [settings]);
 
     const handleOpenSidePanel = useCallback(async () => {
-        // @ts-ignore
-        browser.sidePanel.open({ windowId: (await browser.windows.getLastFocused()).id });
+        if (isFirefoxBuild) {
+            // @ts-ignore
+            browser.sidebarAction.open();
+        } else {
+            // @ts-ignore
+            browser.windows.getLastFocused((window) => browser.sidePanel.open({ windowId: window.id }));
+        }
     }, []);
 
     const handleOpenUserGuide = useCallback(() => {
@@ -92,7 +101,11 @@ export function PopupUi({ commands }: Props) {
         notifySettingsUpdated();
     }, [settingsProvider]);
 
-    const profilesContext = useSettingsProfileContext({ settingsProvider, onProfileChanged: handleProfileChanged });
+    const profilesContext = useSettingsProfileContext({
+        dictionaryProvider,
+        settingsProvider,
+        onProfileChanged: handleProfileChanged,
+    });
 
     if (!settings || !theme || requestingActiveTabPermission === undefined) {
         return null;
@@ -115,6 +128,7 @@ export function PopupUi({ commands }: Props) {
                     <Box>
                         <Popup
                             commands={commands}
+                            dictionaryProvider={dictionaryProvider}
                             settings={settings}
                             onSettingsChanged={handleSettingsChanged}
                             onOpenApp={handleOpenApp}
