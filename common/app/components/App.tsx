@@ -441,7 +441,7 @@ function App({
         promoteBufferedHandlesInSession: promoteBufferedHandlesInFileSession,
         clearBufferedHandlesInSession: clearBufferedHandlesInFileSession,
         saveCachedSubtitleFilesToSession: saveCachedSubtitleFilesToFileSession,
-        retainHandlesInSession: retainHandlesInFileSession,
+        retainSourcesInSession: retainSourcesInFileSession,
     } = useFileSession();
 
     const [lastError, setLastError] = useState<any>();
@@ -1069,7 +1069,7 @@ function App({
                     });
                     setLoadingSources(loadingSources);
 
-                    void retainHandlesInFileSession([
+                    void retainSourcesInFileSession([
                         ...sources.subtitleFiles.map((f) => f.id),
                         ...(sources.videoFile === undefined ? [] : [sources.videoFile.id]),
                     ]);
@@ -1088,7 +1088,7 @@ function App({
                 return false;
             }
         },
-        [handleError, retainHandlesInFileSession]
+        [handleError, retainSourcesInFileSession]
     );
 
     const persistFileSessionHandles = useCallback(

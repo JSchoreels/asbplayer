@@ -90,7 +90,7 @@ export const useFileSession = () => {
         void fileSessionRepository?.clearBuffered();
     }, [fileSessionRepository]);
 
-    const retainHandlesInSession = useCallback(
+    const retainSourcesInSession = useCallback(
         async (ids: string[]) => {
             await fileSessionRepository?.retain(ids);
         },
@@ -106,6 +106,6 @@ export const useFileSession = () => {
         promoteBufferedHandlesInSession,
         clearBufferedHandlesInSession,
         saveCachedSubtitleFilesToSession,
-        retainHandlesInSession,
+        retainSourcesInSession,
     };
 };
