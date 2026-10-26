@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -14,6 +15,51 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 )
+
+func TestAnkiConnectForwardingUsesFreshConnections(t *testing.T) {
+	type receivedRequest struct {
+		method, origin, body, remoteAddr string
+		close                            bool
+	}
+	received := make(chan receivedRequest, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- receivedRequest{r.Method, r.Header.Get("Origin"), string(body), r.RemoteAddr, r.Close}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		io.WriteString(w, `{"result":6,"error":null}`)
+	}))
+	defer upstream.Close()
+	proxy := forwarder{AnkiConnectUrl: upstream.URL}
+	connections := make(map[string]bool)
+
+	for _, method := range []string{http.MethodPost, http.MethodOptions, http.MethodPost, http.MethodPost} {
+		requestBody := `{"action":"version","version":6}`
+		request := httptest.NewRequest(method, "/", strings.NewReader(requestBody))
+		request.Header.Set("Origin", "http://localhost:3000")
+		recorder := httptest.NewRecorder()
+		context := echo.New().NewContext(request, recorder)
+		body, err := proxy.forwardToAnkiConnect(bytes.NewBufferString(requestBody), context, method)
+		if err != nil {
+			t.Fatalf("forwarding %s failed: %v", method, err)
+		}
+
+		got := <-received
+		if !got.close || connections[got.remoteAddr] {
+			t.Fatalf("AnkiConnect request reused a connection or allowed keep-alive: %+v", got)
+		}
+		connections[got.remoteAddr] = true
+		if got.method != method || got.origin != "http://localhost:3000" || got.body != requestBody {
+			t.Fatalf("unexpected forwarded request: %+v", got)
+		}
+		if recorder.Code != http.StatusOK || string(body) != `{"result":6,"error":null}` || recorder.Body.String() != string(body) {
+			t.Fatalf("unexpected proxy response: %d %s", recorder.Code, recorder.Body.String())
+		}
+		if recorder.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+			t.Fatal("the upstream CORS header was not preserved")
+		}
+	}
+}
 
 type harness struct {
 	forwarder forwarder
@@ -487,5 +533,89 @@ func TestCancelDoesNotDiscardADeliveredResponse(t *testing.T) {
 
 	if broker.pendingCount() != 0 {
 		t.Fatalf("expected no pending requests, got %d", broker.pendingCount())
+	}
+}
+
+func TestAnkiConnectConnectionHeadersStayOnEachHop(t *testing.T) {
+	received := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		io.WriteString(w, `6`)
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request.Header.Set("Connection", "keep-alive, X-Client-Only")
+	request.Header.Set("Keep-Alive", "timeout=5")
+	request.Header.Set("X-Client-Only", "must not reach Anki")
+	request.Header.Set("Origin", "chrome-extension://yomitan")
+	request.Header.Set("Authorization", "Bearer example")
+	recorder := httptest.NewRecorder()
+	context := echo.New().NewContext(request, recorder)
+	proxy := forwarder{AnkiConnectUrl: upstream.URL}
+	body, err := proxy.forwardToAnkiConnect(bytes.NewBufferString(`{"action":"version","version":2}`), context, http.MethodPost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := <-received
+	if values := headers.Values("Connection"); len(values) != 1 || values[0] != "close" {
+		t.Fatalf("upstream received conflicting connection headers: %q", values)
+	}
+	if headers.Get("Keep-Alive") != "" || headers.Get("X-Client-Only") != "" {
+		t.Fatalf("browser hop headers reached Anki: %v", headers)
+	}
+	if headers.Get("Origin") != "chrome-extension://yomitan" || headers.Get("Authorization") != "Bearer example" {
+		t.Fatalf("end-to-end request headers were lost: %v", headers)
+	}
+	if recorder.Header().Get("Connection") != "" || recorder.Header().Get("Keep-Alive") != "" {
+		t.Fatalf("upstream hop headers reached the browser: %v", recorder.Header())
+	}
+	if recorder.Code != http.StatusOK || string(body) != "6" || recorder.Header().Get("Access-Control-Allow-Origin") != "chrome-extension://yomitan" {
+		t.Fatalf("response changed: %d %s %v", recorder.Code, body, recorder.Header())
+	}
+}
+
+func TestAnkiConnectErrorWithoutContentTypeIsForwarded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	recorder := httptest.NewRecorder()
+	context := echo.New().NewContext(request, recorder)
+	proxy := forwarder{AnkiConnectUrl: upstream.URL}
+	body, err := proxy.forwardToAnkiConnect(bytes.NewBufferString(`{"action":"version","version":2}`), context, http.MethodPost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusBadRequest || len(body) != 0 || recorder.Body.Len() != 0 {
+		t.Fatalf("upstream error was not forwarded: %d %q", recorder.Code, body)
+	}
+}
+
+func TestProxyHeadersDropNamedConnectionFieldsWithoutChangingSource(t *testing.T) {
+	source := http.Header{
+		"Connection":                  {"keep-alive, X-Local", "X-Other"},
+		"Keep-Alive":                  {"timeout=5"},
+		"X-Local":                     {"local"},
+		"X-Other":                     {"other"},
+		"Authorization":               {"Bearer example"},
+		"Access-Control-Allow-Origin": {"chrome-extension://yomitan"},
+	}
+	destination := make(http.Header)
+	copyProxyHeaders(destination, source)
+	for _, name := range []string{"Connection", "Keep-Alive", "X-Local", "X-Other"} {
+		if destination.Get(name) != "" {
+			t.Fatalf("connection header %s was forwarded: %v", name, destination)
+		}
+		if source.Get(name) == "" {
+			t.Fatalf("original header %s was modified", name)
+		}
+	}
+	if destination.Get("Authorization") != "Bearer example" || destination.Get("Access-Control-Allow-Origin") != "chrome-extension://yomitan" {
+		t.Fatalf("end-to-end headers were lost: %v", destination)
 	}
 }

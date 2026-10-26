@@ -179,33 +179,47 @@ func (forwarder forwarder) publishMessageAndAwaitResponse(command clientCommand)
 	}
 }
 
+// copyProxyHeaders preserves end-to-end headers without forwarding connection
+// settings between the browser/proxy and proxy/Anki TCP connections.
+func copyProxyHeaders(destination, source http.Header) {
+	for header, values := range source {
+		destination[header] = append([]string(nil), values...)
+	}
+	for _, connection := range source.Values("Connection") {
+		for _, header := range strings.Split(connection, ",") {
+			destination.Del(strings.TrimSpace(header))
+		}
+	}
+	for _, header := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		destination.Del(header)
+	}
+}
+
 func (forwarder forwarder) forwardToAnkiConnect(buf *bytes.Buffer, c echo.Context, method string) ([]byte, error) {
 	ankiConnectRequest, err := http.NewRequest(method, forwarder.AnkiConnectUrl, buf)
-
-	for key, values := range c.Request().Header {
-		ankiConnectRequest.Header[key] = values
-	}
 
 	if err != nil {
 		return nil, err
 	}
+
+	// Each request owns its upstream connection. Retrying a failed POST could
+	// create a duplicate note, so never rely on reusing an Anki connection.
+	ankiConnectRequest.Close = true
+	copyProxyHeaders(ankiConnectRequest.Header, c.Request().Header)
 
 	ankiConnectResponse, err := http.DefaultClient.Do(ankiConnectRequest)
 
 	if err != nil {
 		return nil, err
 	}
+	defer ankiConnectResponse.Body.Close()
 
 	ankiConnectResponseBuf := new(bytes.Buffer)
 	ankiConnectResponseBuf.ReadFrom(ankiConnectResponse.Body)
 
-	for header, values := range ankiConnectResponse.Header {
-		for _, value := range values {
-			c.Response().Header().Add(header, value)
-		}
-	}
+	copyProxyHeaders(c.Response().Header(), ankiConnectResponse.Header)
 
-	c.Blob(ankiConnectResponse.StatusCode, ankiConnectResponse.Header["Content-Type"][0], ankiConnectResponseBuf.Bytes())
+	c.Blob(ankiConnectResponse.StatusCode, ankiConnectResponse.Header.Get("Content-Type"), ankiConnectResponseBuf.Bytes())
 	return ankiConnectResponseBuf.Bytes(), nil
 }
 

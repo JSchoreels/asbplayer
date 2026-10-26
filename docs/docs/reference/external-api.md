@@ -229,7 +229,7 @@ The WebSocket server also implements an HTTP-based API which can trigger the com
 
 It also functions as an AnkiConnect proxy that allows `addNote` requests to be enriched with asbplayer-provided context, such as audio and screenshots.
 
-The proxy passes through all AnkiConnect requests as-is except for `addNote`. The proxy's specific behavior in the case of `addNote` depends on the value of `POST_MINE_ACTION` in the configuration documented below.
+The proxy passes through AnkiConnect request bodies and end-to-end headers except for `addNote`. Connection-specific headers are handled separately on each TCP connection, including headers named by `Connection`. Each forwarded request uses a fresh connection to AnkiConnect and is not retried, because retrying a write could create a duplicate note. Upstream error responses are forwarded even when they omit `Content-Type`. The proxy's specific behavior in the case of `addNote` depends on the value of `POST_MINE_ACTION` in the configuration documented below.
 
 ## Server configuration {#server-configuration}
 
